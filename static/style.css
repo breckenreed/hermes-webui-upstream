@@ -7323,24 +7323,18 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 .settings-field-highlight { animation: settings-field-pulse 1.6s ease-out; }
 @keyframes settings-field-pulse { 0% { box-shadow: 0 0 0 0 var(--focus-ring); } 35% { box-shadow: 0 0 0 4px var(--focus-ring); } 100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); } }
 
-/* ── Mobile toolset/MCP access ───────────────────────────────────────────────
-   Upstream hides .composer-toolsets-wrap by default and only reveals it via
-   `@container composer-footer (min-width:1100px)` (#1431). The footer collapse
-   is FIT-based, not breakpoint-based (_fitComposerFooter): full labels ->
-   .cf-icons -> .cf-icons.cf-burger. A phone typically settles in .cf-icons,
-   where the toolsets chip is hidden and no burger panel exists — leaving
-   toolset/MCP selection with no affordance at all, even though
-   /api/session/toolsets kept working for scripted callers.
+/* ── Toolset restriction control in collapsed footers ────────────────────────
+   Upstream hides .composer-toolsets-wrap and reveals it only via
+   `@container composer-footer (min-width:1100px)` (#1431), which no phone
+   reaches — leaving session toolset restrictions with no mobile affordance.
 
-   Both collapsed modes are handled:
-     cf-icons  — chip becomes a 44px icon, same as profile/model/reasoning
-     cf-burger — chip drops out, entry point is the mobile panel action; the
-                 wrap stays in flow (zero-sized) because the dropdown markup
-                 lives INSIDE it and would not render under display:none.
-   Selectors mirror upstream specificity so they win by source order. */
-
-/* cf-icons: icon-only chip, sized like its siblings (see .cf-icons rules). */
-.composer-footer.cf-icons .composer-left > .composer-toolsets-wrap{
+   This follows direction 2 from that issue ("surface only when active"): the
+   control appears in a collapsed footer ONLY while a restriction is set. A
+   default session therefore adds no width, so the collapse stage — and the
+   context ring that .cf-burger hides — is unaffected. Tapping it clears the
+   restriction; there is deliberately no dropdown here, which is what keeps the
+   footer's own fixed-containing-block problem (#6080) out of this path. */
+.composer-footer.cf-icons .composer-left > .composer-toolsets-wrap.has-custom{
   display:block!important;
 }
 .composer-footer.cf-icons .composer-toolsets-label,
@@ -7350,18 +7344,8 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   width:44px;height:44px;max-width:44px;min-width:44px;min-height:44px;
   padding:0;justify-content:center;gap:0;
 }
-
-/* cf-burger: no chip; the burger panel action drives it. Wrap kept in flow at
-   zero size purely so its child dropdown has a rendering context. */
-.composer-footer.cf-burger .composer-left > .composer-toolsets-wrap{
-  display:block!important;
-  width:0;height:0;overflow:visible;
-}
-.composer-footer.cf-burger .composer-toolsets-chip{display:none!important;}
-
-/* AC3: with the chip hidden in burger mode, mark the burger button itself so an
-   active toolset restriction is visible without opening the panel. The button
-   already carries position:relative in both collapsed stages. */
+/* .cf-burger keeps the chip hidden (upstream rule); the panel action drives it,
+   and the button that opens the panel carries the at-a-glance marker. */
 .composer-mobile-config-btn.has-toolset-override::after{
   content:'';
   position:absolute;
@@ -7370,16 +7354,3 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   border-radius:50%;
   background:var(--accent);
 }
-
-/* Phone path (#6080), mirroring .model-dropdown--floating. A CSS-only fixed
-   sheet CANNOT work here: .composer-footer sets container-type:inline-size (and
-   a backdrop-filter under the Geist Contrast skin), each of which establishes a
-   fixed containing block, so `position:fixed` would resolve against the FOOTER
-   and drop the menu below the fold. _positionToolsetsDropdown() therefore
-   reparents the dropdown to <body> and owns left/top/width/maxHeight; this rule
-   only flips positioning and relaxes the desktop width clamps.
-   z-index:190 is deliberate, matching the model picker: ABOVE the
-   .composer-mobile-config-panel it can be opened from, but BELOW the
-   full-screen sidebar drawer and workspace panel. */
-.composer-toolsets-dropdown--floating{position:fixed;bottom:auto;min-width:0;max-width:none;z-index:190;overflow-y:auto;}
-.composer-toolsets-dropdown--floating .toolsets-action-btn{min-height:44px;}

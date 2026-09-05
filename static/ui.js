@@ -5065,22 +5065,10 @@ function _fitComposerFooter(){
   if(!left.clientWidth) return;
   const overflows=function(){return left.scrollWidth>left.clientWidth+1;};
   footer.classList.remove('cf-icons','cf-burger');
-  if(overflows()){
-    footer.classList.add('cf-icons');
-    if(overflows()) footer.classList.add('cf-burger');
-  }
-  // The stage decides the picker's positioning strategy (anchored vs floating),
-  // and these classes land a frame after a resize — the resize handler already
-  // positioned the picker against the PREVIOUS stage. Re-run it now that the
-  // stage is settled, or a picker open across a collapse threshold stays
-  // anchored inside the clipping footer (or floating after expanding) until it
-  // is closed. Every branch above falls through to here on purpose.
-  try{
-    const dd=document.getElementById('composerToolsetsDropdown');
-    if(dd&&dd.classList.contains('open')&&typeof _positionToolsetsDropdown==='function'){
-      _positionToolsetsDropdown();
-    }
-  }catch(_){ }
+  if(!overflows()) return;
+  footer.classList.add('cf-icons');
+  if(!overflows()) return;
+  footer.classList.add('cf-burger');
 }
 window._fitComposerFooter=_fitComposerFooter;
 
@@ -5461,17 +5449,45 @@ function _applyToolsetsChip(toolsets) {
     chip.classList.remove('has-custom');
     chip.title = t('session_toolsets') + ': ' + t('session_toolsets_profile_defaults');
   }
-  // Mirror the label into the mobile burger panel. The chip is hidden below the
-  // 1100px container query (#1431) and was never mirrored into the mobile
-  // config panel — which left toolset/MCP selection with NO mobile affordance
-  // at all, even though /api/session/toolsets kept working for scripted callers.
-  const mobileLabel = $('composerMobileToolsetsLabel');
-  if (mobileLabel) mobileLabel.textContent = label.textContent;
-  // In burger mode the chip is gone, so `.has-custom` has nothing to colour.
-  // Flag the burger button itself so an active restriction stays visible at a
-  // glance with the panel closed (#1431 acceptance criterion 3).
+  // Collapsed footers surface this control ONLY while a restriction is active
+  // (#1431, direction 2). Mirroring `has-custom` onto the wrap lets CSS gate it
+  // without :has(), and keeps a default session from adding any width to the
+  // footer — so the collapse stage, and with it the context ring, is untouched.
+  wrap.classList.toggle('has-custom', !!hasCustom);
+  const mobileAction = $('composerMobileToolsetsAction');
+  if (mobileAction) {
+    mobileAction.style.display = hasCustom ? '' : 'none';
+    const mobileLabel = $('composerMobileToolsetsLabel');
+    if (mobileLabel) mobileLabel.textContent = label.textContent;
+  }
+  // In .cf-burger the chip is hidden, so mark the button that opens the panel.
   const mobileBtn = $('composerMobileConfigBtn');
   if (mobileBtn) mobileBtn.classList.toggle('has-toolset-override', !!hasCustom);
+}
+
+// Single entry point for both the footer chip and the mobile panel action.
+//
+// Uncollapsed footer: open the full picker, exactly as before.
+//
+// Collapsed footer (.cf-icons / .cf-burger): there is no room for the picker,
+// and a floating surface there has to escape .composer-footer's own containing
+// block (container-type:inline-size, plus a backdrop-filter under some skins —
+// see #6080). Rather than carry that machinery for a cramped surface, the
+// collapsed control is one-shot: it clears the session restriction and returns
+// to profile defaults. It only exists while a restriction is active, so there is
+// always something to clear. Choosing a specific toolset list stays a desktop
+// affordance, with /api/session/toolsets unchanged for scripted callers.
+function activateToolsetsControl() {
+  const footer = document.querySelector('.composer-footer');
+  const collapsed = footer && footer.classList
+    && (footer.classList.contains('cf-icons') || footer.classList.contains('cf-burger'));
+  if (collapsed) {
+    if (Array.isArray(_currentSessionToolsets) && _currentSessionToolsets.length) {
+      _applySessionToolsets(null);
+    }
+    return;
+  }
+  toggleToolsetsDropdown();
 }
 
 function _syncToolsetsChip() {
@@ -5621,113 +5637,18 @@ function _populateToolsetsDropdown() {
   _renderToolsetsPresetSections({ state, input });
 }
 
-// The picker has two entry points: the footer chip (full + .cf-icons stages)
-// and the mobile config panel action (.cf-burger, where the chip is hidden).
-// Return whichever is actually rendered, or null when neither is.
-function _activeToolsetsTrigger() {
-  const chip = $('composerToolsetsChip');
-  if (chip && chip.offsetParent !== null) return chip;
-  const action = $('composerMobileToolsetsAction');
-  if (action && action.offsetParent !== null) return action;
-  return null;
-}
-
-let _toolsetsDropdownHome = null;
-
-// Put the dropdown back inside the footer and drop every inline coordinate the
-// phone path wrote, so the desktop CSS anchor is identical to master.
-function _restoreToolsetsDropdownHome() {
-  const dd = $('composerToolsetsDropdown');
-  if (!dd) return;
-  dd.classList.remove('composer-toolsets-dropdown--floating');
-  dd.style.left = '';
-  dd.style.top = '';
-  dd.style.bottom = '';
-  dd.style.width = '';
-  dd.style.maxWidth = '';
-  dd.style.maxHeight = '';
-  if (_toolsetsDropdownHome && _toolsetsDropdownHome.parent && dd.parentNode !== _toolsetsDropdownHome.parent) {
-    const ref = _toolsetsDropdownHome.nextSibling;
-    if (ref && ref.parentNode === _toolsetsDropdownHome.parent) {
-      _toolsetsDropdownHome.parent.insertBefore(dd, ref);
-    } else {
-      _toolsetsDropdownHome.parent.appendChild(dd);
-    }
-  }
-}
-
 function _positionToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
-  const footer = document.querySelector('.composer-footer');
-  if (!dd || !footer) return;
   const chip = $('composerToolsetsChip');
-  const mobileAction = $('composerMobileToolsetsAction');
-  const panel = $('composerMobileConfigPanel');
-  // Anchor to whichever entry point the user actually reached for.
-  const anchor = (panel && panel.classList.contains('open') && mobileAction)
-    ? mobileAction
-    : (chip && chip.offsetParent ? chip : mobileAction);
-  if (!anchor) return;
-  // Gate on the COLLAPSE STAGE, not on viewport width. _fitComposerFooter() picks
-  // the stage by available space, so `.cf-icons` / `.cf-burger` occur well above
-  // 640px (a narrow desktop window, or a tablet with a long model label). Keying
-  // this to a width media query left collapsed layouts between 641px and ~900px
-  // on the anchored path, where `.composer-left`'s hidden vertical overflow clips
-  // the upward-opening picker — and in `.cf-burger` the hidden chip made the
-  // anchored path close the dropdown outright.
-  const collapsed = footer.classList
-    && (footer.classList.contains('cf-icons') || footer.classList.contains('cf-burger'));
-  if (collapsed) {
-    // #6080: .composer-footer sets container-type:inline-size (and a
-    // backdrop-filter under the Geist Contrast skin) — both establish a fixed
-    // containing block, so a position:fixed dropdown left inside the footer
-    // resolves against the FOOTER instead of the viewport and lands below the
-    // fold. Reparent to <body>, the same idiom as #composerModelDropdown and
-    // #profileDropdown, then compute coordinates against the visual viewport.
-    if (!_toolsetsDropdownHome) {
-      _toolsetsDropdownHome = { parent: dd.parentNode, nextSibling: dd.nextSibling };
-    }
-    if (dd.parentNode !== document.body) document.body.appendChild(dd);
-    dd.classList.add('composer-toolsets-dropdown--floating');
-    const anchorRect = anchor.getBoundingClientRect();
-    const vv = window.visualViewport;
-    const viewportWidth = Math.max(1, Number(vv && vv.width) || window.innerWidth || 1);
-    const viewportHeight = Math.max(1, Number(vv && vv.height) || window.innerHeight || 1);
-    const viewportTop = Math.max(0, Number(vv && vv.offsetTop) || 0);
-    const viewportLeft = Math.max(0, Number(vv && vv.offsetLeft) || 0);
-    const viewportBottom = viewportTop + viewportHeight;
-    const viewportRight = viewportLeft + viewportWidth;
-    const margin = 8;
-    const gap = 6;
-    const titlebar = document.querySelector('.app-titlebar');
-    const titlebarBottom = titlebar && typeof titlebar.getBoundingClientRect === 'function'
-      ? Number(titlebar.getBoundingClientRect().bottom) || 0
-      : 0;
-    const contentTop = Math.max(viewportTop + margin, titlebarBottom + margin);
-    const menuWidth = Math.max(1, viewportWidth - margin * 2);
-    const left = Math.max(viewportLeft + margin, Math.min(anchorRect.left, viewportRight - menuWidth - margin));
-    dd.style.left = left + 'px';
-    dd.style.width = menuWidth + 'px';
-    dd.style.maxWidth = menuWidth + 'px';
-    dd.style.bottom = 'auto';
-    const menuHeight = Math.max(dd.scrollHeight, dd.offsetHeight);
-    const aboveSpace = Math.max(0, anchorRect.top - contentTop - gap - margin);
-    const belowSpace = Math.max(0, viewportBottom - anchorRect.bottom - gap - margin);
-    const openAbove = aboveSpace >= Math.min(menuHeight, belowSpace) || aboveSpace >= belowSpace;
-    const availableHeight = Math.max(1, openAbove ? aboveSpace : belowSpace);
-    dd.style.maxHeight = availableHeight + 'px';
-    const visibleHeight = Math.min(menuHeight || availableHeight, availableHeight);
-    const top = openAbove ? anchorRect.top - gap - visibleHeight : anchorRect.bottom + gap;
-    dd.style.top = Math.max(contentTop, Math.min(top, viewportBottom - margin - visibleHeight)) + 'px';
-    return;
-  }
-  // Uncollapsed footer: unchanged master behaviour — an absolutely positioned
-  // .composer-footer child. Restore in case a prior collapsed open moved it.
-  _restoreToolsetsDropdownHome();
-  if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
-  const anchorRect = anchor.getBoundingClientRect();
+  const footer = document.querySelector('.composer-footer');
+  if (!dd || !chip || !footer) return;
+  // Defense: if the chip has been hidden by responsive CSS (e.g. resize across
+  // 1100px container threshold while dropdown was open), don't try to anchor
+  // to a zero-rect element — close the dropdown instead. (#1431)
+  if (chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  const chipRect = chip.getBoundingClientRect();
   const footerRect = footer.getBoundingClientRect();
-  let left = anchorRect.left - footerRect.left;
+  let left = chipRect.left - footerRect.left;
   const maxLeft = Math.max(0, footer.clientWidth - dd.offsetWidth);
   left = Math.max(0, Math.min(left, maxLeft));
   dd.style.left = left + 'px';
@@ -5735,11 +5656,11 @@ function _positionToolsetsDropdown() {
 
 function toggleToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
-  if (!dd) return;
-  // Don't open when NO entry point is rendered. Gating on the chip alone left
-  // the .cf-burger panel action dead, since the chip is hidden in that stage.
-  const trigger = _activeToolsetsTrigger();
-  if (!trigger) return;
+  const chip = $('composerToolsetsChip');
+  if (!dd || !chip) return;
+  // Don't open when the chip itself is hidden by responsive CSS (#1431).
+  // offsetParent === null catches display:none on the element or any ancestor.
+  if (chip.offsetParent === null) return;
   const open = dd.classList.contains('open');
   if (open) { closeToolsetsDropdown(); return; }
   if (typeof closeProfileDropdown === 'function') closeProfileDropdown();
@@ -5758,24 +5679,16 @@ function toggleToolsetsDropdown() {
   });
   dd.classList.add('open');
   _positionToolsetsDropdown();
-  trigger.classList.add('active');
-  trigger.setAttribute('aria-expanded', 'true');
+  chip.classList.add('active');
   // Focus the input after a tick so the layout has settled
   setTimeout(() => { const inp = $('toolsetsInput'); if (inp) inp.focus(); }, 50);
 }
 
 function closeToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
+  const chip = $('composerToolsetsChip');
   if (dd) dd.classList.remove('open');
-  _restoreToolsetsDropdownHome();
-  // Clear both entry points: either may have opened it, and the stage can change
-  // underneath an open dropdown.
-  ['composerToolsetsChip', 'composerMobileToolsetsAction'].forEach(function(id) {
-    const el = $(id);
-    if (!el) return;
-    el.classList.remove('active');
-    el.setAttribute('aria-expanded', 'false');
-  });
+  if (chip) chip.classList.remove('active');
 }
 
 function _applySessionToolsets(toolsets) {
@@ -5817,7 +5730,6 @@ function _applySessionToolsets(toolsets) {
 document.addEventListener('click', function(e) {
   if (
     !e.target.closest('#composerToolsetsChip') &&
-    !e.target.closest('#composerMobileToolsetsAction') &&
     !e.target.closest('#composerToolsetsDropdown')
   ) closeToolsetsDropdown();
   // Active profile defaults button
