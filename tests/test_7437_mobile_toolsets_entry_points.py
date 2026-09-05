@@ -13,13 +13,17 @@ minimal DOM stub, asserting observable behavior rather than source strings:
 
   1. the picker opens from BOTH entry points,
   2. `aria-expanded` tracks the dropdown on whichever trigger opened it,
-  3. the fixed bottom sheet is not given a stale inline `left`,
-  4. tapping the mobile action is not treated as an outside click.
+  3. the picker escapes the footer's containing block with viewport-relative
+     geometry, in every collapsed stage and at tablet widths too,
+  4. tapping the mobile action is not treated as an outside click, while a
+     genuine outside click still closes.
 
-Each assertion fails against the pre-fix sources: the toggle gated on the chip's
-`offsetParent` (dead action in burger mode), `_positionToolsetsDropdown()` wrote
-a footer-relative inline `left` over the fixed sheet, and the outside-click
-handler did not know the mobile action existed.
+Each assertion fails against sources predating the fix it covers: the toggle
+gated on the chip's `offsetParent` (dead action in burger mode); the dropdown
+stayed inside `.composer-footer`, whose `container-type: inline-size` makes it
+the containing block for `position: fixed`; the collapse stage was inferred from
+a width media query even though `_fitComposerFooter()` picks it by available
+space; and the outside-click handler did not know the mobile action existed.
 """
 import json
 import os
@@ -68,7 +72,7 @@ def _outside_click_handler(src: str) -> str:
     return _slice_balanced(src, j)
 
 
-def _run(stage: str, click_target: str | None = None) -> dict:
+def _run(stage: str, click_target: str | None = None, viewport_width: int = 390) -> dict:
     """Drive the real toggle/close sources in a given collapse stage.
 
     stage: "icons"  -> chip rendered, mobile action hidden
@@ -79,6 +83,7 @@ def _run(stage: str, click_target: str | None = None) -> dict:
     payload = {
         "stage": stage,
         "clickTarget": click_target,
+        "viewportWidth": viewport_width,
         "sources": "\n".join([
             _function(src, "_activeToolsetsTrigger") if "_activeToolsetsTrigger" in src else "",
             _function(src, "_restoreToolsetsDropdownHome") if "_restoreToolsetsDropdownHome" in src else "",
@@ -137,9 +142,11 @@ const $ = (id) => els[id] || null;
 
 // The footer exists in both collapsed stages; the sheet is fixed-positioned
 // there, which is exactly what the positioning routine must respect.
+const footerCls = new Set(params.stage === 'burger' ? ['cf-icons', 'cf-burger'] : ['cf-icons']);
 const footer = {
   getBoundingClientRect: () => ({ left: 0, top: 700, bottom: 800 }),
-  clientWidth: 390,
+  clientWidth: params.viewportWidth,
+  classList: { contains: (c) => footerCls.has(c), add: (c) => footerCls.add(c), remove: (c) => footerCls.delete(c) },
 };
 const body = { _children: [], appendChild(el) { this._children.push(el); el.parentNode = body; } };
 const document = {
@@ -148,9 +155,11 @@ const document = {
 };
 // Phone viewport: the reparenting path is what we want to exercise.
 const window = {
-  matchMedia: (q) => ({ matches: q.indexOf('max-width:640px') !== -1 }),
-  visualViewport: { width: 390, height: 800, offsetTop: 0, offsetLeft: 0 },
-  innerWidth: 390,
+  // Honest media query: only true when the viewport really is <= 640px. A
+  // tablet run must therefore reach the floating path via the stage classes.
+  matchMedia: (q) => ({ matches: params.viewportWidth <= 640 }),
+  visualViewport: { width: params.viewportWidth, height: 800, offsetTop: 0, offsetLeft: 0 },
+  innerWidth: params.viewportWidth,
   innerHeight: 800,
 };
 const getComputedStyle = () => ({ position: 'fixed' });
@@ -282,3 +291,24 @@ class TestToolsetsEntryPoints:
         assert out["closedByOutsideClick"] is True, (
             f"a genuine outside click must still close the picker; got {out}"
         )
+
+    def test_collapsed_tablet_still_escapes_the_footer(self):
+        """Collapse is fit-based, so `.cf-icons` / `.cf-burger` occur above 640px.
+
+        Keying the floating path to a width media query left collapsed layouts
+        between 641px and ~900px on the anchored path, inside `.composer-left`
+        whose hidden vertical overflow clips the upward-opening picker — and in
+        `.cf-burger` the hidden chip made that path close the dropdown outright.
+        The strategy must follow the stage, not the viewport width.
+        """
+        for stage in ("icons", "burger"):
+            out = _run(stage, viewport_width=820)
+            assert out["open"] is True, (
+                f"picker must open in a collapsed {stage} tablet layout; got {out}"
+            )
+            assert out["reparentedToBody"] is True, (
+                f"collapsed {stage} at 820px must still escape the footer; got {out}"
+            )
+            assert out["floating"] is True, (
+                f"collapsed {stage} at 820px must carry the floating modifier; got {out}"
+            )

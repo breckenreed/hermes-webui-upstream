@@ -5656,8 +5656,16 @@ function _positionToolsetsDropdown() {
     ? mobileAction
     : (chip && chip.offsetParent ? chip : mobileAction);
   if (!anchor) return;
-  const isPhone = typeof window.matchMedia === 'function' && window.matchMedia('(max-width:640px)').matches;
-  if (isPhone) {
+  // Gate on the COLLAPSE STAGE, not on viewport width. _fitComposerFooter() picks
+  // the stage by available space, so `.cf-icons` / `.cf-burger` occur well above
+  // 640px (a narrow desktop window, or a tablet with a long model label). Keying
+  // this to a width media query left collapsed layouts between 641px and ~900px
+  // on the anchored path, where `.composer-left`'s hidden vertical overflow clips
+  // the upward-opening picker — and in `.cf-burger` the hidden chip made the
+  // anchored path close the dropdown outright.
+  const collapsed = footer.classList
+    && (footer.classList.contains('cf-icons') || footer.classList.contains('cf-burger'));
+  if (collapsed) {
     // #6080: .composer-footer sets container-type:inline-size (and a
     // backdrop-filter under the Geist Contrast skin) — both establish a fixed
     // containing block, so a position:fixed dropdown left inside the footer
@@ -5701,8 +5709,8 @@ function _positionToolsetsDropdown() {
     dd.style.top = Math.max(contentTop, Math.min(top, viewportBottom - margin - visibleHeight)) + 'px';
     return;
   }
-  // Desktop (>640px): unchanged master behaviour — an absolutely positioned
-  // .composer-footer child. Restore in case a prior phone open moved it.
+  // Uncollapsed footer: unchanged master behaviour — an absolutely positioned
+  // .composer-footer child. Restore in case a prior collapsed open moved it.
   _restoreToolsetsDropdownHome();
   if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
   const anchorRect = anchor.getBoundingClientRect();
