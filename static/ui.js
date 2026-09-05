@@ -5609,11 +5609,28 @@ function _populateToolsetsDropdown() {
   _renderToolsetsPresetSections({ state, input });
 }
 
+// The picker has two entry points: the footer chip (full + .cf-icons stages)
+// and the mobile config panel action (.cf-burger, where the chip is hidden).
+// Return whichever is actually rendered, or null when neither is.
+function _activeToolsetsTrigger() {
+  const chip = $('composerToolsetsChip');
+  if (chip && chip.offsetParent !== null) return chip;
+  const action = $('composerMobileToolsetsAction');
+  if (action && action.offsetParent !== null) return action;
+  return null;
+}
+
 function _positionToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
-  const chip = $('composerToolsetsChip');
   const footer = document.querySelector('.composer-footer');
-  if (!dd || !chip || !footer) return;
+  if (!dd || !footer) return;
+  // In the collapsed stages the dropdown is a fixed bottom sheet positioned
+  // entirely by CSS (left/right/bottom). An inline `left` computed against the
+  // footer would be re-interpreted against the viewport and, combined with
+  // `right: 8px`, would shift or narrow the sheet. Clear it and let CSS own it.
+  if (getComputedStyle(dd).position === 'fixed') { dd.style.left = ''; return; }
+  const chip = $('composerToolsetsChip');
+  if (!chip) return;
   // Defense: if the chip has been hidden by responsive CSS (e.g. resize across
   // 1100px container threshold while dropdown was open), don't try to anchor
   // to a zero-rect element — close the dropdown instead. (#1431)
@@ -5628,11 +5645,11 @@ function _positionToolsetsDropdown() {
 
 function toggleToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
-  const chip = $('composerToolsetsChip');
-  if (!dd || !chip) return;
-  // Don't open when the chip itself is hidden by responsive CSS (#1431).
-  // offsetParent === null catches display:none on the element or any ancestor.
-  if (chip.offsetParent === null) return;
+  if (!dd) return;
+  // Don't open when NO entry point is rendered. Gating on the chip alone left
+  // the .cf-burger panel action dead, since the chip is hidden in that stage.
+  const trigger = _activeToolsetsTrigger();
+  if (!trigger) return;
   const open = dd.classList.contains('open');
   if (open) { closeToolsetsDropdown(); return; }
   if (typeof closeProfileDropdown === 'function') closeProfileDropdown();
@@ -5651,16 +5668,23 @@ function toggleToolsetsDropdown() {
   });
   dd.classList.add('open');
   _positionToolsetsDropdown();
-  chip.classList.add('active');
+  trigger.classList.add('active');
+  trigger.setAttribute('aria-expanded', 'true');
   // Focus the input after a tick so the layout has settled
   setTimeout(() => { const inp = $('toolsetsInput'); if (inp) inp.focus(); }, 50);
 }
 
 function closeToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
-  const chip = $('composerToolsetsChip');
   if (dd) dd.classList.remove('open');
-  if (chip) chip.classList.remove('active');
+  // Clear both entry points: either may have opened it, and the stage can change
+  // underneath an open dropdown.
+  ['composerToolsetsChip', 'composerMobileToolsetsAction'].forEach(function(id) {
+    const el = $(id);
+    if (!el) return;
+    el.classList.remove('active');
+    el.setAttribute('aria-expanded', 'false');
+  });
 }
 
 function _applySessionToolsets(toolsets) {
@@ -5702,6 +5726,7 @@ function _applySessionToolsets(toolsets) {
 document.addEventListener('click', function(e) {
   if (
     !e.target.closest('#composerToolsetsChip') &&
+    !e.target.closest('#composerMobileToolsetsAction') &&
     !e.target.closest('#composerToolsetsDropdown')
   ) closeToolsetsDropdown();
   // Active profile defaults button
