@@ -7359,6 +7359,18 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
 }
 .composer-footer.cf-burger .composer-toolsets-chip{display:none!important;}
 
+/* AC3: with the chip hidden in burger mode, mark the burger button itself so an
+   active toolset restriction is visible without opening the panel. The button
+   already carries position:relative in both collapsed stages. */
+.composer-mobile-config-btn.has-toolset-override::after{
+  content:'';
+  position:absolute;
+  top:6px;right:6px;
+  width:8px;height:8px;
+  border-radius:50%;
+  background:var(--accent);
+}
+
 /* In both collapsed modes .composer-left is overflow-x:auto, which would clip
    an absolutely-positioned dropdown. Re-anchor it as a fixed bottom sheet. */
 .composer-footer.cf-icons .composer-toolsets-dropdown,

@@ -5455,6 +5455,11 @@ function _applyToolsetsChip(toolsets) {
   // at all, even though /api/session/toolsets kept working for scripted callers.
   const mobileLabel = $('composerMobileToolsetsLabel');
   if (mobileLabel) mobileLabel.textContent = label.textContent;
+  // In burger mode the chip is gone, so `.has-custom` has nothing to colour.
+  // Flag the burger button itself so an active restriction stays visible at a
+  // glance with the panel closed (#1431 acceptance criterion 3).
+  const mobileBtn = $('composerMobileConfigBtn');
+  if (mobileBtn) mobileBtn.classList.toggle('has-toolset-override', !!hasCustom);
 }
 
 function _syncToolsetsChip() {
