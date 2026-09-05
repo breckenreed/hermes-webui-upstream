@@ -5065,10 +5065,22 @@ function _fitComposerFooter(){
   if(!left.clientWidth) return;
   const overflows=function(){return left.scrollWidth>left.clientWidth+1;};
   footer.classList.remove('cf-icons','cf-burger');
-  if(!overflows()) return;
-  footer.classList.add('cf-icons');
-  if(!overflows()) return;
-  footer.classList.add('cf-burger');
+  if(overflows()){
+    footer.classList.add('cf-icons');
+    if(overflows()) footer.classList.add('cf-burger');
+  }
+  // The stage decides the picker's positioning strategy (anchored vs floating),
+  // and these classes land a frame after a resize — the resize handler already
+  // positioned the picker against the PREVIOUS stage. Re-run it now that the
+  // stage is settled, or a picker open across a collapse threshold stays
+  // anchored inside the clipping footer (or floating after expanding) until it
+  // is closed. Every branch above falls through to here on purpose.
+  try{
+    const dd=document.getElementById('composerToolsetsDropdown');
+    if(dd&&dd.classList.contains('open')&&typeof _positionToolsetsDropdown==='function'){
+      _positionToolsetsDropdown();
+    }
+  }catch(_){ }
 }
 window._fitComposerFooter=_fitComposerFooter;
 

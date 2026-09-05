@@ -128,7 +128,7 @@ const originalParent = { _kids: [], insertBefore(el) { this._kids.push(el); el.p
 dd.parentNode = originalParent;
 dd.nextSibling = null;
 dd.scrollHeight = 240;
-const chip = makeEl('composerToolsetsChip', stage === 'icons');
+const chip = makeEl('composerToolsetsChip', stage === 'icons' || stage === 'desktop');
 const action = makeEl('composerMobileToolsetsAction', stage === 'burger');
 const els = {
   composerToolsetsDropdown: dd,
@@ -142,7 +142,10 @@ const $ = (id) => els[id] || null;
 
 // The footer exists in both collapsed stages; the sheet is fixed-positioned
 // there, which is exactly what the positioning routine must respect.
-const footerCls = new Set(params.stage === 'burger' ? ['cf-icons', 'cf-burger'] : ['cf-icons']);
+const footerCls = new Set(
+  params.stage === 'burger' ? ['cf-icons', 'cf-burger']
+  : params.stage === 'desktop' ? []
+  : ['cf-icons']);
 const footer = {
   getBoundingClientRect: () => ({ left: 0, top: 700, bottom: 800 }),
   clientWidth: params.viewportWidth,
@@ -312,3 +315,26 @@ class TestToolsetsEntryPoints:
             assert out["floating"] is True, (
                 f"collapsed {stage} at 820px must carry the floating modifier; got {out}"
             )
+
+    def test_uncollapsed_desktop_keeps_the_anchored_path(self):
+        """The wide footer must behave exactly as it did on master.
+
+        Everything this PR adds is scoped to the collapsed stages; an
+        uncollapsed footer keeps the dropdown as an absolutely positioned
+        `.composer-footer` child with a footer-relative inline `left`. Guards
+        against the floating path leaking upward into desktop, which would
+        change a surface this PR has no business touching.
+        """
+        out = _run("desktop", viewport_width=1440)
+        assert out["open"] is True, f"desktop picker must still open; got {out}"
+        assert out["openedBy"] == "chip", f"desktop opens from the chip; got {out}"
+        assert out["reparentedToBody"] is False, (
+            f"desktop must NOT reparent the dropdown to <body>; got {out}"
+        )
+        assert out["floating"] is False, (
+            f"desktop must not carry the floating modifier; got {out}"
+        )
+        # Footer-relative offset, the master behaviour: chip.left 44 - footer.left 0.
+        assert out["inlineLeft"] == "44px", (
+            f"desktop must keep the anchored footer-relative offset; got {out}"
+        )
