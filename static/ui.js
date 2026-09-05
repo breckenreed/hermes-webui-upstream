@@ -5449,6 +5449,12 @@ function _applyToolsetsChip(toolsets) {
     chip.classList.remove('has-custom');
     chip.title = t('session_toolsets') + ': ' + t('session_toolsets_profile_defaults');
   }
+  // Mirror the label into the mobile burger panel. The chip is hidden below the
+  // 1100px container query (#1431) and was never mirrored into the mobile
+  // config panel — which left toolset/MCP selection with NO mobile affordance
+  // at all, even though /api/session/toolsets kept working for scripted callers.
+  const mobileLabel = $('composerMobileToolsetsLabel');
+  if (mobileLabel) mobileLabel.textContent = label.textContent;
 }
 
 function _syncToolsetsChip() {

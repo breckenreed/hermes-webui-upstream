@@ -1483,6 +1483,7 @@ def test_mobile_config_kickers_have_i18n_fallbacks():
         ("composer_mobile_model", "Model"),
         ("composer_mobile_quota", "Quota"),
         ("composer_mobile_reasoning", "Reasoning"),
+        ("composer_mobile_toolsets", "Toolsets"),
         ("composer_mobile_context", "Context"),
     ):
         assert f'data-i18n="{key}">{label}</span>' in panel_html, \

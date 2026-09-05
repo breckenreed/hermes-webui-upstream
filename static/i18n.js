@@ -1740,6 +1740,7 @@ const LOCALES = {
     composer_mobile_model: 'Model',
     composer_mobile_quota: 'Quota',
     composer_mobile_reasoning: 'Reasoning',
+    composer_mobile_toolsets: 'Toolsets',
     composer_mobile_context: 'Context',
     media_audio_label: 'Audio',
     media_svg_label: 'Diagram',
