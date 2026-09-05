@@ -7371,17 +7371,15 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   background:var(--accent);
 }
 
-/* In both collapsed modes .composer-left is overflow-x:auto, which would clip
-   an absolutely-positioned dropdown. Re-anchor it as a fixed bottom sheet. */
-.composer-footer.cf-icons .composer-toolsets-dropdown,
-.composer-footer.cf-burger .composer-toolsets-dropdown{
-  position:fixed;
-  left:8px;right:8px;
-  bottom:calc(env(safe-area-inset-bottom,0px) + 92px);
-  min-width:0;max-width:none;
-  max-height:60dvh;overflow-y:auto;
-}
-.composer-footer.cf-icons .composer-toolsets-dropdown .toolsets-action-btn,
-.composer-footer.cf-burger .composer-toolsets-dropdown .toolsets-action-btn{
-  min-height:44px;
-}
+/* Phone path (#6080), mirroring .model-dropdown--floating. A CSS-only fixed
+   sheet CANNOT work here: .composer-footer sets container-type:inline-size (and
+   a backdrop-filter under the Geist Contrast skin), each of which establishes a
+   fixed containing block, so `position:fixed` would resolve against the FOOTER
+   and drop the menu below the fold. _positionToolsetsDropdown() therefore
+   reparents the dropdown to <body> and owns left/top/width/maxHeight; this rule
+   only flips positioning and relaxes the desktop width clamps.
+   z-index:190 is deliberate, matching the model picker: ABOVE the
+   .composer-mobile-config-panel it can be opened from, but BELOW the
+   full-screen sidebar drawer and workspace panel. */
+.composer-toolsets-dropdown--floating{position:fixed;bottom:auto;min-width:0;max-width:none;z-index:190;overflow-y:auto;}
+.composer-toolsets-dropdown--floating .toolsets-action-btn{min-height:44px;}

@@ -81,6 +81,8 @@ def _run(stage: str, click_target: str | None = None) -> dict:
         "clickTarget": click_target,
         "sources": "\n".join([
             _function(src, "_activeToolsetsTrigger") if "_activeToolsetsTrigger" in src else "",
+            _function(src, "_restoreToolsetsDropdownHome") if "_restoreToolsetsDropdownHome" in src else "",
+            "let _toolsetsDropdownHome = null;" if "_toolsetsDropdownHome" in src else "",
             _function(src, "_positionToolsetsDropdown"),
             _function(src, "toggleToolsetsDropdown"),
             _function(src, "closeToolsetsDropdown"),
@@ -116,6 +118,11 @@ function makeEl(id, rendered) {
 }
 
 const dd = makeEl('composerToolsetsDropdown', true);
+const originalParent = { _kids: [], insertBefore(el) { this._kids.push(el); el.parentNode = this; },
+                         appendChild(el) { this._kids.push(el); el.parentNode = this; } };
+dd.parentNode = originalParent;
+dd.nextSibling = null;
+dd.scrollHeight = 240;
 const chip = makeEl('composerToolsetsChip', stage === 'icons');
 const action = makeEl('composerMobileToolsetsAction', stage === 'burger');
 const els = {
@@ -130,9 +137,21 @@ const $ = (id) => els[id] || null;
 
 // The footer exists in both collapsed stages; the sheet is fixed-positioned
 // there, which is exactly what the positioning routine must respect.
-const footer = { getBoundingClientRect: () => ({ left: 0 }), clientWidth: 390 };
+const footer = {
+  getBoundingClientRect: () => ({ left: 0, top: 700, bottom: 800 }),
+  clientWidth: 390,
+};
+const body = { _children: [], appendChild(el) { this._children.push(el); el.parentNode = body; } };
 const document = {
+  body,
   querySelector: (sel) => (sel === '.composer-footer' ? footer : null),
+};
+// Phone viewport: the reparenting path is what we want to exercise.
+const window = {
+  matchMedia: (q) => ({ matches: q.indexOf('max-width:640px') !== -1 }),
+  visualViewport: { width: 390, height: 800, offsetTop: 0, offsetLeft: 0 },
+  innerWidth: 390,
+  innerHeight: 800,
 };
 const getComputedStyle = () => ({ position: 'fixed' });
 
@@ -150,7 +169,7 @@ const showToast = () => {};
 const t = (k) => k;
 
 const runner = new Function(
-  '$', 'document', 'getComputedStyle', 'setTimeout',
+  '$', 'document', 'window', 'getComputedStyle', 'setTimeout',
   'closeProfileDropdown', 'closeWsDropdown', 'closeModelDropdown',
   'closeReasoningDropdown', '_syncToolsetsChip', '_populateToolsetsDropdown',
   '_renderToolsetsPresetSections', '_loadToolsetsCatalog',
@@ -158,7 +177,7 @@ const runner = new Function(
   params.sources + '\nreturn {toggleToolsetsDropdown, closeToolsetsDropdown, outside: ' + params.outsideHandler + '};'
 );
 const api = runner(
-  $, document, getComputedStyle, () => {},
+  $, document, window, getComputedStyle, () => {},
   closeProfileDropdown, closeWsDropdown, closeModelDropdown,
   closeReasoningDropdown, _syncToolsetsChip, _populateToolsetsDropdown,
   _renderToolsetsPresetSections, _loadToolsetsCatalog,
@@ -183,6 +202,8 @@ if (params.clickTarget) {
 console.log(JSON.stringify({
   open: dd.classList.contains('open'),
   openedBy,
+  reparentedToBody: dd.parentNode === body,
+  floating: dd.classList.contains('composer-toolsets-dropdown--floating'),
   inlineLeft: dd.style.left,
   chipAria: chip.getAttribute('aria-expanded') || null,
   actionAria: action.getAttribute('aria-expanded') || null,
@@ -221,17 +242,27 @@ class TestToolsetsEntryPoints:
         assert _run("icons")["chipAria"] == "true"
         assert _run("burger")["actionAria"] == "true"
 
-    def test_fixed_sheet_does_not_keep_a_stale_inline_offset(self):
-        """A footer-relative inline `left` would be re-read against the viewport.
+    def test_phone_dropdown_escapes_the_footer_containing_block(self):
+        """`.composer-footer` sets container-type:inline-size, which makes it the
+        containing block for `position: fixed` descendants — a fixed dropdown left
+        inside it resolves against the FOOTER, not the viewport, and lands below
+        the fold (#6080). The picker must therefore be reparented to <body> and
+        given viewport-relative coordinates, the same idiom as the model picker.
 
-        Combined with `right: 8px` that shifts or narrows the sheet, so the
-        positioning routine must clear it whenever the dropdown is fixed.
-        Fails pre-fix: the routine unconditionally wrote `dd.style.left`.
+        Fails pre-fix: the dropdown stayed inside the footer and the routine wrote
+        a footer-relative inline `left` over it.
         """
         for stage in ("icons", "burger"):
             out = _run(stage)
-            assert out["inlineLeft"] in ("", None), (
-                f"fixed sheet must not carry an inline left in {stage}; got {out}"
+            assert out["reparentedToBody"] is True, (
+                f"picker must escape the footer containing block in {stage}; got {out}"
+            )
+            assert out["floating"] is True, (
+                f"picker must carry the floating modifier in {stage}; got {out}"
+            )
+            # Viewport-relative geometry, not a footer offset.
+            assert out["inlineLeft"] == "8px", (
+                f"left must be clamped to the viewport margin in {stage}; got {out}"
             )
 
     def test_tapping_the_mobile_action_is_not_an_outside_click(self):

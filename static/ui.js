@@ -5620,24 +5620,94 @@ function _activeToolsetsTrigger() {
   return null;
 }
 
+let _toolsetsDropdownHome = null;
+
+// Put the dropdown back inside the footer and drop every inline coordinate the
+// phone path wrote, so the desktop CSS anchor is identical to master.
+function _restoreToolsetsDropdownHome() {
+  const dd = $('composerToolsetsDropdown');
+  if (!dd) return;
+  dd.classList.remove('composer-toolsets-dropdown--floating');
+  dd.style.left = '';
+  dd.style.top = '';
+  dd.style.bottom = '';
+  dd.style.width = '';
+  dd.style.maxWidth = '';
+  dd.style.maxHeight = '';
+  if (_toolsetsDropdownHome && _toolsetsDropdownHome.parent && dd.parentNode !== _toolsetsDropdownHome.parent) {
+    const ref = _toolsetsDropdownHome.nextSibling;
+    if (ref && ref.parentNode === _toolsetsDropdownHome.parent) {
+      _toolsetsDropdownHome.parent.insertBefore(dd, ref);
+    } else {
+      _toolsetsDropdownHome.parent.appendChild(dd);
+    }
+  }
+}
+
 function _positionToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
   const footer = document.querySelector('.composer-footer');
   if (!dd || !footer) return;
-  // In the collapsed stages the dropdown is a fixed bottom sheet positioned
-  // entirely by CSS (left/right/bottom). An inline `left` computed against the
-  // footer would be re-interpreted against the viewport and, combined with
-  // `right: 8px`, would shift or narrow the sheet. Clear it and let CSS own it.
-  if (getComputedStyle(dd).position === 'fixed') { dd.style.left = ''; return; }
   const chip = $('composerToolsetsChip');
-  if (!chip) return;
-  // Defense: if the chip has been hidden by responsive CSS (e.g. resize across
-  // 1100px container threshold while dropdown was open), don't try to anchor
-  // to a zero-rect element — close the dropdown instead. (#1431)
-  if (chip.offsetParent === null) { closeToolsetsDropdown(); return; }
-  const chipRect = chip.getBoundingClientRect();
+  const mobileAction = $('composerMobileToolsetsAction');
+  const panel = $('composerMobileConfigPanel');
+  // Anchor to whichever entry point the user actually reached for.
+  const anchor = (panel && panel.classList.contains('open') && mobileAction)
+    ? mobileAction
+    : (chip && chip.offsetParent ? chip : mobileAction);
+  if (!anchor) return;
+  const isPhone = typeof window.matchMedia === 'function' && window.matchMedia('(max-width:640px)').matches;
+  if (isPhone) {
+    // #6080: .composer-footer sets container-type:inline-size (and a
+    // backdrop-filter under the Geist Contrast skin) — both establish a fixed
+    // containing block, so a position:fixed dropdown left inside the footer
+    // resolves against the FOOTER instead of the viewport and lands below the
+    // fold. Reparent to <body>, the same idiom as #composerModelDropdown and
+    // #profileDropdown, then compute coordinates against the visual viewport.
+    if (!_toolsetsDropdownHome) {
+      _toolsetsDropdownHome = { parent: dd.parentNode, nextSibling: dd.nextSibling };
+    }
+    if (dd.parentNode !== document.body) document.body.appendChild(dd);
+    dd.classList.add('composer-toolsets-dropdown--floating');
+    const anchorRect = anchor.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const viewportWidth = Math.max(1, Number(vv && vv.width) || window.innerWidth || 1);
+    const viewportHeight = Math.max(1, Number(vv && vv.height) || window.innerHeight || 1);
+    const viewportTop = Math.max(0, Number(vv && vv.offsetTop) || 0);
+    const viewportLeft = Math.max(0, Number(vv && vv.offsetLeft) || 0);
+    const viewportBottom = viewportTop + viewportHeight;
+    const viewportRight = viewportLeft + viewportWidth;
+    const margin = 8;
+    const gap = 6;
+    const titlebar = document.querySelector('.app-titlebar');
+    const titlebarBottom = titlebar && typeof titlebar.getBoundingClientRect === 'function'
+      ? Number(titlebar.getBoundingClientRect().bottom) || 0
+      : 0;
+    const contentTop = Math.max(viewportTop + margin, titlebarBottom + margin);
+    const menuWidth = Math.max(1, viewportWidth - margin * 2);
+    const left = Math.max(viewportLeft + margin, Math.min(anchorRect.left, viewportRight - menuWidth - margin));
+    dd.style.left = left + 'px';
+    dd.style.width = menuWidth + 'px';
+    dd.style.maxWidth = menuWidth + 'px';
+    dd.style.bottom = 'auto';
+    const menuHeight = Math.max(dd.scrollHeight, dd.offsetHeight);
+    const aboveSpace = Math.max(0, anchorRect.top - contentTop - gap - margin);
+    const belowSpace = Math.max(0, viewportBottom - anchorRect.bottom - gap - margin);
+    const openAbove = aboveSpace >= Math.min(menuHeight, belowSpace) || aboveSpace >= belowSpace;
+    const availableHeight = Math.max(1, openAbove ? aboveSpace : belowSpace);
+    dd.style.maxHeight = availableHeight + 'px';
+    const visibleHeight = Math.min(menuHeight || availableHeight, availableHeight);
+    const top = openAbove ? anchorRect.top - gap - visibleHeight : anchorRect.bottom + gap;
+    dd.style.top = Math.max(contentTop, Math.min(top, viewportBottom - margin - visibleHeight)) + 'px';
+    return;
+  }
+  // Desktop (>640px): unchanged master behaviour — an absolutely positioned
+  // .composer-footer child. Restore in case a prior phone open moved it.
+  _restoreToolsetsDropdownHome();
+  if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  const anchorRect = anchor.getBoundingClientRect();
   const footerRect = footer.getBoundingClientRect();
-  let left = chipRect.left - footerRect.left;
+  let left = anchorRect.left - footerRect.left;
   const maxLeft = Math.max(0, footer.clientWidth - dd.offsetWidth);
   left = Math.max(0, Math.min(left, maxLeft));
   dd.style.left = left + 'px';
@@ -5677,6 +5747,7 @@ function toggleToolsetsDropdown() {
 function closeToolsetsDropdown() {
   const dd = $('composerToolsetsDropdown');
   if (dd) dd.classList.remove('open');
+  _restoreToolsetsDropdownHome();
   // Clear both entry points: either may have opened it, and the stage can change
   // underneath an open dropdown.
   ['composerToolsetsChip', 'composerMobileToolsetsAction'].forEach(function(id) {
