@@ -646,7 +646,7 @@
               </div>
             </div>
             <button class="icon-btn composer-mobile-config-btn" id="composerMobileConfigBtn" type="button" onclick="toggleMobileComposerConfig()" title="Workspace, model, quota, reasoning, and context settings" aria-label="Workspace, model, quota, reasoning, and context settings" aria-haspopup="true" aria-expanded="false" aria-controls="composerMobileConfigPanel">
-              <svg id="composerMobileCtxRing" viewBox="0 0 36 36" width="24" height="24" style="display:block;overflow:visible;transform:rotate(-90deg)" aria-hidden="true"><circle cx="18" cy="18" r="14" fill="none" stroke="currentColor" stroke-width="3.5" opacity="0.2"/><circle id="ctx-arc" cx="18" cy="18" r="14" fill="none" stroke="#22c55e" stroke-width="3.5" stroke-dasharray="87.96 87.96" stroke-dashoffset="87.96" stroke-linecap="round"/><text id="ctx-num" x="18" y="18" text-anchor="middle" dominant-baseline="middle" style="transform:rotate(90deg);transform-origin:18px 18px;font-size:9px;font-weight:700;fill:currentColor;stroke:none">0</text></svg>
+              <svg id="composerMobileCtxRing" class="composer-mobile-ctx-ring" viewBox="0 0 36 36" width="24" height="24" style="display:block;overflow:visible;transform:rotate(-90deg)" aria-hidden="true"><circle class="composer-mobile-ctx-track" cx="18" cy="18" r="14" fill="none" stroke="currentColor" stroke-width="3.5" opacity="0.2"/><circle id="ctx-arc" class="composer-mobile-ctx-arc" cx="18" cy="18" r="14" fill="none" stroke-width="3.5" stroke-dasharray="87.96 87.96" stroke-dashoffset="87.96" stroke-linecap="round"/><text id="ctx-num" x="18" y="18" text-anchor="middle" dominant-baseline="middle" style="transform:rotate(90deg);transform-origin:18px 18px;font-size:9px;font-weight:700;fill:currentColor;stroke:none">&middot;</text></svg>
             </button>
             <div class="composer-model-wrap">
               <button class="composer-model-chip" id="composerModelChip" type="button" onclick="toggleModelDropdown()" title="Conversation model">
@@ -699,7 +699,7 @@
           <div class="composer-right">
             <span class="composer-status" id="composerStatus" style="display:none"></span>
             <div class="ctx-indicator-wrap" id="ctxIndicatorWrap" style="display:none">
-              <button class="ctx-indicator" id="ctxIndicator" type="button" aria-label="Context window usage" aria-describedby="ctxTooltip">
+              <button class="ctx-indicator" id="ctxIndicator" type="button" aria-label="Context window usage" data-i18n-aria-label="ctx_indicator_aria" aria-describedby="ctxTooltip">
                 <span class="ctx-ring">
                   <svg class="ctx-ring-svg" viewBox="0 0 24 24" aria-hidden="true">
                     <circle class="ctx-ring-track" cx="12" cy="12" r="9.75"></circle>
@@ -709,7 +709,7 @@
                 </span>
               </button>
               <div class="ctx-tooltip" id="ctxTooltip" role="tooltip" aria-hidden="true">
-                <div class="ctx-tooltip-title">Context window</div>
+                <div class="ctx-tooltip-title" data-i18n="ctx_window_label">Context window</div>
                 <div class="ctx-tooltip-line" id="ctxTooltipUsage"></div>
                 <div class="ctx-tooltip-line" id="ctxTooltipTokens"></div>
                 <div class="ctx-tooltip-line" id="ctxTooltipThreshold"></div>

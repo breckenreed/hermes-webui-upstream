@@ -50,7 +50,10 @@ def test_context_indicator_surfaces_cache_hit_rate():
     assert "cacheWriteTok=usage.cache_write_tokens||0" in src
     assert "cacheHitPct=usage.cache_hit_percent" in src
     assert "t('usage_cache_hit_detail',cacheHitPct" in src
-    assert "Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}" in src
+    # The cost line is localized now; what matters here is that it still
+    # formats the same amount and still carries the cache detail.
+    assert "t('ctx_estimated_cost',`$${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`)" in src
+    assert "if(cacheText) costText+=` \\u00b7 ${cacheText}`;" in src
     assert "cacheHitPct=msg._turnUsage.cache_hit_percent" in src
     assert "t('usage_cached_percent',cacheHitPct)" in src
     assert "cacheHitPct!=null" in src

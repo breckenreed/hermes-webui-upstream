@@ -2246,9 +2246,10 @@ function _applySessionContextMetadataUpdate(data){
     const u=S.lastUsage||{};
     const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
     _syncCtxIndicator({
-      input_tokens:_pick(u.input_tokens,S.session.input_tokens),
-      output_tokens:_pick(u.output_tokens,S.session.output_tokens),
-      estimated_cost:_pick(u.estimated_cost,S.session.estimated_cost),
+      // Counters (tokens, cost, cache) come from the shared assembler: this
+      // path used to list its own subset and silently omitted every cache
+      // field, so changing the model blanked the cache-hit line in the tooltip.
+      ..._ctxIndicatorUsageCounters(S.session,u),
       context_length:S.session.context_length||0,
       last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
       post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,

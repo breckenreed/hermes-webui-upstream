@@ -286,6 +286,9 @@ function createEnvironment() {
   globalThis.clearLiveToolCards = () => { liveCardClears += 1; };
 
   globalThis._syncCtxIndicator = () => {};
+  // Lives in ui.js, which this harness does not load; loadSession spreads its
+  // result into the context-indicator payload.
+  globalThis._ctxIndicatorUsageCounters = () => ({});
   globalThis._renderPendingPromptsForActiveSession = () => {};
   globalThis._restoreComposerDraft = () => {};
   globalThis.renderSessionArtifacts = () => {};
