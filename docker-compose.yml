@@ -40,6 +40,17 @@ services:
         # 1 = resolve every dependency at build time into a root-owned venv the
         # runtime user cannot write to. 0 = legacy install-at-container-start.
         BAKE_RUNTIME: ${BAKE_RUNTIME:-1}
+        # Cache-busting fingerprint for static assets. api/updates.py cannot run
+        # `git describe` inside the image (.git is excluded by .dockerignore), so
+        # without this arg WEBUI_VERSION is "unknown" — and every asset is then
+        # served as `?v=unknown` with `Cache-Control: max-age=31536000, immutable`
+        # (api/routes.py) plus a fixed `hermes-shell-unknown` service-worker cache.
+        # A rebuilt UI therefore never reaches a browser that has loaded the app
+        # once. Set it per build so the URLs and the SW cache name rotate:
+        #   $env:HERMES_VERSION = (git describe --tags --always --dirty)   # PowerShell
+        #   export HERMES_VERSION="$(git describe --tags --always --dirty)" # bash
+        # ./scripts/docker-build.{sh,ps1} already pass it.
+        HERMES_VERSION: ${HERMES_VERSION:-unknown}
     ports:
       # Host address to publish on. Default: loopback only. To reach the UI
       # from other machines, set HERMES_WEBUI_BIND in .env to a specific
