@@ -2356,12 +2356,7 @@ async function loadSession(sid){
     const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
     const _pickPositive=(latest,stored,dflt=0)=>Number(latest)>0?latest:(Number(stored)>0?stored:dflt);
     _syncCtxIndicator({
-      input_tokens:      _pick(u.input_tokens,      _s.input_tokens),
-      output_tokens:     _pick(u.output_tokens,     _s.output_tokens),
-      estimated_cost:    _pick(u.estimated_cost,    _s.estimated_cost),
-      cache_read_tokens: _pick(u.cache_read_tokens, _s.cache_read_tokens),
-      cache_write_tokens:_pick(u.cache_write_tokens,_s.cache_write_tokens),
-      cache_hit_percent: _pick(u.cache_hit_percent, _s.cache_hit_percent, null),
+      ..._ctxIndicatorUsageCounters(_s,u),
       context_length:    _pickPositive(u.context_length, _s.context_length),
       last_prompt_tokens:_pick(u.last_prompt_tokens,_s.last_prompt_tokens),
       post_compression_context_tokens_estimate:_s.post_compression_context_tokens_estimate||null,
@@ -3003,12 +2998,7 @@ function _resolveSessionModelForDisplaySoon(sid){
         const u=S.lastUsage||{};
         const _pick=(latest,stored,dflt=0)=>latest!=null?latest:(stored!=null?stored:dflt);
         _syncCtxIndicator({
-          input_tokens:_pick(u.input_tokens,S.session.input_tokens),
-          output_tokens:_pick(u.output_tokens,S.session.output_tokens),
-          estimated_cost:_pick(u.estimated_cost,S.session.estimated_cost),
-          cache_read_tokens:_pick(u.cache_read_tokens,S.session.cache_read_tokens),
-          cache_write_tokens:_pick(u.cache_write_tokens,S.session.cache_write_tokens),
-          cache_hit_percent:_pick(u.cache_hit_percent,S.session.cache_hit_percent,null),
+          ..._ctxIndicatorUsageCounters(S.session,u),
           context_length:resolvedContextLength||u.context_length||0,
           last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
           post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,

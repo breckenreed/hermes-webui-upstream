@@ -464,15 +464,246 @@ def _gateway_sse_reasoning_delta(payload: dict) -> str:
         return ""
 
 
+def _gateway_usage_int(value) -> int:
+    """Coerce a gateway-reported token count to int without killing the stream.
+
+    Gateways and the providers behind them disagree about whether counts arrive
+    as ints, floats or numeric strings. A ValueError here would abort a turn
+    that otherwise completed, so anything unparseable counts as zero.
+    """
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _gateway_stream_usage(payload: dict) -> dict:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
         return {}
-    return {
-        "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+    prompt_tokens = _gateway_usage_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
+    out = {
+        "input_tokens": prompt_tokens,
+        "output_tokens": _gateway_usage_int(usage.get("completion_tokens") or usage.get("output_tokens")),
         "estimated_cost": usage.get("estimated_cost") or usage.get("estimated_cost_usd") or 0,
+        # The context indicator divides the size of the request that was
+        # actually sent by the model's window. `prompt_tokens` IS that
+        # numerator for an OpenAI-shaped response: it counts the whole context
+        # submitted for this turn, not a delta. Without it the WebUI has no
+        # numerator at all and every gateway-backed turn renders "no data".
+        "last_prompt_tokens": prompt_tokens,
     }
+    details = usage.get("prompt_tokens_details")
+    cache_read = _gateway_usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
+    if not cache_read:
+        cache_read = _gateway_usage_int(
+            usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
+        )
+    cache_write = _gateway_usage_int(
+        usage.get("cache_creation_input_tokens") or usage.get("cache_write_tokens")
+    )
+    if cache_read:
+        out["cache_read_tokens"] = cache_read
+    if cache_write:
+        out["cache_write_tokens"] = cache_write
+    return out
+
+
+def _gateway_context_length(cfg, model: str, model_provider: str) -> int:
+    """Resolve the model's context window for a gateway turn.
+
+    The gateway reports how many tokens a turn spent but never the size of the
+    window they are measured against, so without this the WebUI divides by its
+    own 128K JavaScript default and shows a percentage for the wrong model.
+    The in-process path resolves the same number from model metadata; the base
+    URL is deliberately left to config, because the gateway's own URL is not
+    the model provider's.
+    """
+    if not str(model or "").strip():
+        return 0
+    try:
+        from agent.model_metadata import get_model_context_length
+        from api.routes import _context_length_lookup_inputs_for_model
+
+        lookup = _context_length_lookup_inputs_for_model(
+            model,
+            model_provider,
+            cfg=cfg if isinstance(cfg, dict) else {},
+        )
+        try:
+            resolved = get_model_context_length(
+                model,
+                lookup.base_url,
+                api_key=lookup.api_key,
+                config_context_length=lookup.config_context_length,
+                provider=lookup.provider or model_provider or "",
+                custom_providers=lookup.custom_providers,
+            )
+        except TypeError:
+            # Older hermes-agent builds only accept the legacy 2-arg form.
+            resolved = get_model_context_length(model, lookup.base_url)
+        return _gateway_usage_int(resolved)
+    except Exception:
+        logger.debug("Gateway context-length resolution failed for %s", model, exc_info=True)
+        return 0
+
+
+# Share of the context window at which a finished gateway turn compresses
+# itself. The in-process path leaves this to the agent's own compressor, which
+# a gateway deployment does not expose, so a gateway session had no ceiling at
+# all: the indicator could read 169% and nothing acted on it. 75 is the step
+# where the ring turns red and offers the manual button, so the automatic
+# ceiling and the visible warning are the same number.
+_GATEWAY_AUTO_COMPRESS_PCT_DEFAULT = 75
+
+# session_id -> the request size that last triggered an attempt. Compression is
+# allowed to report "unchanged"; without this guard a context that cannot
+# shrink would be summarized again after every single turn.
+_GATEWAY_AUTO_COMPRESS_LAST_TRIGGER: dict[str, int] = {}
+
+
+def gateway_auto_compress_pct(cfg) -> int:
+    """Percent of the window that triggers auto-compression, 0 to disable.
+
+    Overridable with ``webui_auto_compress_pct`` in config.yaml.
+    """
+    raw = cfg.get("webui_auto_compress_pct") if isinstance(cfg, dict) else None
+    if raw is None:
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    try:
+        pct = int(float(raw))
+    except (TypeError, ValueError):
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    return max(0, min(100, pct))
+
+
+def gateway_auto_compress_threshold_tokens(cfg, context_length) -> int:
+    """The token count the auto-compress ceiling lands on for this window."""
+    window = _gateway_usage_int(context_length)
+    pct = gateway_auto_compress_pct(cfg)
+    if not window or not pct:
+        return 0
+    return int(round(window * pct / 100))
+
+
+def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -> bool:
+    """Start a compression job when the finished turn sat above the ceiling.
+
+    Runs the same job the composer's "compress now" button starts, so the
+    guards, the status endpoint and the transcript marker are all the existing
+    ones. Returns whether a job was admitted.
+    """
+    pct = gateway_auto_compress_pct(cfg)
+    if not pct or not session_id:
+        return False
+    window = _gateway_usage_int((usage or {}).get("context_length"))
+    prompt_tokens = _gateway_usage_int((usage or {}).get("last_prompt_tokens"))
+    if not window or not prompt_tokens:
+        return False
+    if prompt_tokens * 100 < window * pct:
+        return False
+    if prompt_tokens <= _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.get(session_id, 0):
+        # Already attempted at this size and the context did not come down.
+        # Wait until it actually grows again.
+        return False
+    try:
+        # Compression runs in this process against the local agent bundle. A
+        # WebUI deployed without it can still talk to a gateway, and there the
+        # honest answer is to leave the context alone rather than fail a job on
+        # every turn above the ceiling.
+        import agent.context_compressor  # noqa: F401
+    except Exception:
+        logger.debug("Gateway auto-compression unavailable: no local compressor")
+        return False
+    try:
+        from api.routes import _ManualCompressionMemoryHandler, _handle_session_compress_start
+
+        handler = _ManualCompressionMemoryHandler()
+        _handle_session_compress_start(handler, {"session_id": session_id})
+        payload = handler.payload()
+    except Exception:
+        logger.debug("Gateway auto-compression could not start for %s", session_id, exc_info=True)
+        return False
+    started = isinstance(payload, dict) and payload.get("status") == "running"
+    if started:
+        _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER[session_id] = prompt_tokens
+        logger.info(
+            "Gateway auto-compression started for session %s (%s of %s tokens, ceiling %s%%)",
+            session_id, prompt_tokens, window, pct,
+        )
+    return started
+
+
+def _apply_gateway_usage_to_session(session, usage: dict, *, cfg=None, model: str = "",
+                                    model_provider: str = "") -> dict:
+    """Fold one gateway turn's usage into the session and complete the payload.
+
+    Gateway responses carry per-request counts; the session stores cumulative
+    ones, and nothing on this path was writing either. A gateway-backed session
+    therefore reloaded with every counter at zero and an empty context meter,
+    however many tokens it had spent.
+
+    Cost is assigned rather than accumulated: whether a gateway reports it per
+    request or per session is not part of the OpenAI-shaped contract, so this
+    keeps the number the gateway sent instead of risking a double count.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    turn_prompt_tokens = _gateway_usage_int(usage.get("last_prompt_tokens") or usage.get("input_tokens"))
+    turn_output_tokens = _gateway_usage_int(usage.get("output_tokens"))
+    turn_cache_read = _gateway_usage_int(usage.get("cache_read_tokens"))
+    turn_cache_write = _gateway_usage_int(usage.get("cache_write_tokens"))
+
+    if session is not None:
+        if turn_prompt_tokens:
+            session.input_tokens = _gateway_usage_int(getattr(session, "input_tokens", 0)) + turn_prompt_tokens
+            session.last_prompt_tokens = turn_prompt_tokens
+        if turn_output_tokens:
+            session.output_tokens = _gateway_usage_int(getattr(session, "output_tokens", 0)) + turn_output_tokens
+        if turn_cache_read:
+            session.cache_read_tokens = _gateway_usage_int(getattr(session, "cache_read_tokens", 0)) + turn_cache_read
+        if turn_cache_write:
+            session.cache_write_tokens = _gateway_usage_int(getattr(session, "cache_write_tokens", 0)) + turn_cache_write
+        cost = usage.get("estimated_cost")
+        if cost:
+            session.estimated_cost = cost
+        resolved_context_length = _gateway_context_length(cfg, model, model_provider)
+        if resolved_context_length:
+            session.context_length = resolved_context_length
+        # The ceiling this path enforces itself, so the tooltip's "auto-compress
+        # at …" line states a number that something actually acts on.
+        auto_threshold = gateway_auto_compress_threshold_tokens(
+            cfg, getattr(session, "context_length", 0)
+        )
+        if auto_threshold:
+            session.threshold_tokens = auto_threshold
+        usage["threshold_tokens"] = _gateway_usage_int(getattr(session, "threshold_tokens", 0))
+        usage["context_length"] = _gateway_usage_int(getattr(session, "context_length", 0))
+        # The indicator reads input/output as session totals (the in-process
+        # path reports the agent's running counters), so hand back the folded
+        # values rather than this turn's slice.
+        usage["input_tokens"] = _gateway_usage_int(getattr(session, "input_tokens", 0))
+        usage["output_tokens"] = _gateway_usage_int(getattr(session, "output_tokens", 0))
+        cumulative_cache_read = _gateway_usage_int(getattr(session, "cache_read_tokens", 0))
+        cumulative_cache_write = _gateway_usage_int(getattr(session, "cache_write_tokens", 0))
+        if cumulative_cache_read or cumulative_cache_write:
+            usage["cache_read_tokens"] = cumulative_cache_read
+            usage["cache_write_tokens"] = cumulative_cache_write
+            try:
+                from api.usage import prompt_cache_hit_percent
+
+                usage["cache_hit_percent"] = prompt_cache_hit_percent(
+                    cumulative_cache_read,
+                    usage["input_tokens"],
+                )
+            except Exception:
+                logger.debug("Gateway cache-hit percent failed", exc_info=True)
+        usage["post_compression_context_tokens_estimate"] = getattr(
+            session, "post_compression_context_tokens_estimate", None
+        )
+    if turn_prompt_tokens:
+        usage["last_prompt_tokens"] = turn_prompt_tokens
+    return usage
 
 
 def _gateway_reasoning_delta(payload: dict) -> str:
@@ -1362,6 +1593,17 @@ def _run_gateway_chat_streaming(
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
+            # Context metering for gateway turns. The in-process path fills
+            # these counters from the agent's compressor before saving; nothing
+            # on this path did, so a gateway-backed session came back from a
+            # reload with an empty context meter no matter what it had spent.
+            usage = _apply_gateway_usage_to_session(
+                s,
+                usage,
+                cfg=cfg,
+                model=model,
+                model_provider=model_provider,
+            )
 
             def _restore_cancelled_success_writeback():
                 if pending_source == "process_wakeup":
@@ -1441,6 +1683,10 @@ def _run_gateway_chat_streaming(
         from api.streaming import _session_payload_with_full_messages
         gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
+        # Announce the compression only once the job exists, so the frontend
+        # polls a job that is already registered rather than racing it.
+        if maybe_autocompress_gateway_session(session_id, usage, cfg):
+            put_gateway_event("compress_started", {"session_id": session_id, "automatic": True})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
         try:

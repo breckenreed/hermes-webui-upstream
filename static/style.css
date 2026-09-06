@@ -2717,6 +2717,14 @@
   .ctx-ring-center{position:relative;display:flex;width:15px;height:15px;align-items:center;justify-content:center;border-radius:999px;background:var(--bg);font-size:8px;font-weight:600;line-height:1;color:var(--muted);font-variant-numeric:tabular-nums;}
   .ctx-indicator.ctx-mid .ctx-ring-value{stroke:var(--warning);}
   .ctx-indicator.ctx-high .ctx-ring-value{stroke:var(--error);}
+  /* Context ring on the burger config button (#3062). It renders the same
+     number as the composer ring above, so it uses the same colour steps and
+     the same theme tokens. It used to set three hardcoded hex values from JS,
+     which ignored every theme and turned red ten points later than every other
+     surface showing that number. */
+  .composer-mobile-ctx-arc{stroke:var(--success);transition:stroke-dashoffset .45s ease,stroke .25s ease;}
+  .composer-mobile-ctx-ring.ctx-mid .composer-mobile-ctx-arc{stroke:var(--warning);}
+  .composer-mobile-ctx-ring.ctx-high .composer-mobile-ctx-arc{stroke:var(--error);}
   .ctx-tooltip{position:absolute;right:0;bottom:calc(100% + 10px);min-width:210px;max-width:250px;padding:10px 12px;border:1px solid var(--border2);border-radius:12px;background:var(--surface);box-shadow:0 12px 30px rgba(0,0,0,.28);font-size:11px;line-height:1.45;color:var(--muted);opacity:0;transform:translateY(4px);pointer-events:none;transition:opacity .14s ease,transform .14s ease;z-index:30;}
   .ctx-tooltip::after{content:'';position:absolute;right:10px;top:100%;border-width:6px 6px 0 6px;border-style:solid;border-color:var(--surface) transparent transparent transparent;}
   .ctx-indicator-wrap:hover .ctx-tooltip,.ctx-indicator-wrap:focus-within .ctx-tooltip,.ctx-tooltip-active{opacity:1;transform:translateY(0);pointer-events:auto;}

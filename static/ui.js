@@ -6781,6 +6781,50 @@ function _clearActivityElapsedTimer(){
 
 const _MOBILE_CONFIG_BASE_LABEL='Workspace, model, quota, reasoning, and context settings';
 
+// ── Context-usage colour steps: one source for every surface ────────────────
+// The same percentage is drawn in three places — the composer ring, the ring
+// on the burger config button, and the context row inside the mobile config
+// panel. They must agree. The burger ring used to turn red only above 85 while
+// the other two turned red above 75, so an 80%-full context rendered an amber
+// ring next to a red row and a "compress now" button.
+const CTX_USAGE_MID_PCT=50;
+const CTX_USAGE_HIGH_PCT=75;
+
+function _ctxUsageLevel(pct,hasPromptTok){
+  if(!hasPromptTok)return '';
+  const value=Number(pct)||0;
+  if(value>CTX_USAGE_HIGH_PCT)return 'ctx-high';
+  if(value>CTX_USAGE_MID_PCT)return 'ctx-mid';
+  return '';
+}
+
+function _applyCtxUsageLevel(el,level){
+  if(!el||!el.classList)return;
+  el.classList.toggle('ctx-mid',level==='ctx-mid');
+  el.classList.toggle('ctx-high',level==='ctx-high');
+}
+
+// Circumference of the burger-button ring (r=14), matching the stroke-dasharray
+// baked into its markup.
+const _MOBILE_CTX_RING_CIRCUMFERENCE=87.96;
+
+// The burger ring mirrors the composer ring, so it has to treat "no last-prompt
+// data" the same way: '·', never a filled-in 0. A 0 here reads as "the context
+// is empty", which is a claim the data does not support (#1436). The text badge
+// this ring replaced honoured that; the ring dropped the check and always drew
+// a green zero. Colour comes from a class so it follows the active theme
+// instead of three hardcoded hex values.
+function _setMobileCtxRing(hasPromptTok,pct){
+  const ring=$('composerMobileCtxRing');
+  const arc=$('ctx-arc');
+  const num=$('ctx-num');
+  _applyCtxUsageLevel(ring,_ctxUsageLevel(pct,hasPromptTok));
+  if(!arc||!num)return;
+  const value=hasPromptTok?Math.max(0,Math.min(100,Number(pct)||0)):0;
+  arc.setAttribute('stroke-dashoffset',String(_MOBILE_CTX_RING_CIRCUMFERENCE*(1-value/100)));
+  num.textContent=hasPromptTok?String(value):'\u00b7';
+}
+
 function _setCtxCompressButton(btn,text){
   if(!btn)return;
   if(text){
@@ -6813,28 +6857,11 @@ function _syncMobileCtxDisplay(state){
       mobileConfigBtn.setAttribute('title',_MOBILE_CONFIG_BASE_LABEL);
     }
     _setCtxCompressButton(compressBtn,'');
-    // Reset context ring to 0% to clear any stale values from previous sessions
-    var arc = document.getElementById('ctx-arc');
-    var num = document.getElementById('ctx-num');
-    if (arc && num) {
-      var circumference = 87.96;
-      arc.setAttribute('stroke-dashoffset', circumference);
-      num.textContent = '0';
-      arc.setAttribute('stroke', '#22c55e');
-    }
+    // Empty the ring so a previous session's share cannot linger on the button.
+    _setMobileCtxRing(false,0);
     return;
   }
-  (function updateCtxRing(pct) {
-    var arc = document.getElementById('ctx-arc');
-    var num = document.getElementById('ctx-num');
-    if (!arc || !num) return;
-    var offset = 87.96 * (1 - Math.min(pct, 100) / 100);
-    arc.setAttribute('stroke-dashoffset', offset);
-    num.textContent = Math.round(pct);
-    arc.setAttribute('stroke',
-      pct <= 50 ? '#22c55e' : pct <= 85 ? '#f97316' : '#ef4444'
-    );
-  })(state.pct);
+  _setMobileCtxRing(!!state.hasPromptTok,state.pct);
   if(mobileConfigBtn){
     mobileConfigBtn.setAttribute('aria-label',`${_MOBILE_CONFIG_BASE_LABEL}; ${state.label}`);
     mobileConfigBtn.setAttribute('title',`${_MOBILE_CONFIG_BASE_LABEL} \u00b7 ${state.label}`);
@@ -6842,8 +6869,7 @@ function _syncMobileCtxDisplay(state){
   if(row){
     row.style.display='';
     row.setAttribute('aria-label',state.label);
-    row.classList.toggle('ctx-mid',state.pct>50&&state.pct<=75);
-    row.classList.toggle('ctx-high',state.pct>75);
+    _applyCtxUsageLevel(row,_ctxUsageLevel(state.pct,state.hasPromptTok));
   }
   if(usageLine)usageLine.textContent=state.usageText||'';
   if(tokensLine)tokensLine.textContent=state.tokensText||'';
@@ -6893,6 +6919,34 @@ function _mergeUsageForCtxIndicator(latest, fallback){
     merged.post_compression_context_tokens_estimate=fallbackObj.post_compression_context_tokens_estimate;
   }
   return merged;
+}
+
+// The counter half of an indicator payload: tokens, cost, cache. Every
+// hydration path resolves these the same way — the live stream value when it
+// has one, the persisted session value as a backfill — so they are assembled
+// in one place instead of being retyped at each call site.
+//
+// Retyping them is what broke the tooltip: the model-change path listed no
+// cache fields at all, so picking a different model dropped the cache-hit
+// detail out of the tooltip until the next metering event arrived.
+//
+// The context half (window, threshold, last-prompt tokens, post-compression
+// estimate) deliberately stays inline at each call site, because those differ
+// by path: a session load prefers a positive live window over a stale
+// snapshot (#3660), while a model change must prefer the freshly returned
+// session metadata over the window the previous model reported.
+function _ctxIndicatorUsageCounters(session,latestUsage){
+  const s=(session&&typeof session==='object')?session:{};
+  const u=(latestUsage&&typeof latestUsage==='object')?latestUsage:{};
+  const pick=(live,stored,dflt=0)=>live!=null?live:(stored!=null?stored:dflt);
+  return {
+    input_tokens:pick(u.input_tokens,s.input_tokens),
+    output_tokens:pick(u.output_tokens,s.output_tokens),
+    estimated_cost:pick(u.estimated_cost,s.estimated_cost),
+    cache_read_tokens:pick(u.cache_read_tokens,s.cache_read_tokens),
+    cache_write_tokens:pick(u.cache_write_tokens,s.cache_write_tokens),
+    cache_hit_percent:pick(u.cache_hit_percent,s.cache_hit_percent,null),
+  };
 }
 
 // Context usage indicator in composer footer
@@ -6953,33 +7007,35 @@ function _syncCtxIndicator(usage){
   }
   if(center) center.textContent=hasPromptTok?String(pct):'\u00b7';
   const hasExplicitCtx=!!usage.context_length;
-  el.classList.toggle('ctx-mid',pct>50&&pct<=75);
-  el.classList.toggle('ctx-high',pct>75);
+  _applyCtxUsageLevel(el,_ctxUsageLevel(pct,hasPromptTok));
   // ── Compress affordance (#524) ──
   // Show a hint in the tooltip when context usage is high so users
   // discover /compress without having to know the slash command.
   const compressWrap=$('ctxTooltipCompress');
   const compressBtn=$('ctxCompressBtn');
-  const compressText=pct>=75?t('ctx_compress_action'):(pct>=50?t('ctx_compress_hint'):'');
+  const compressText=pct>=CTX_USAGE_HIGH_PCT?t('ctx_compress_action'):(pct>=CTX_USAGE_MID_PCT?t('ctx_compress_hint'):'');
   if(compressWrap) compressWrap.style.display=compressText?'':'none';
   _setCtxCompressButton(compressBtn,compressText);
   const cacheHitPct=usage.cache_hit_percent;
   const cacheText=cacheHitPct!=null?t('usage_cache_hit_detail',cacheHitPct,_fmtTokens(cacheReadTok),_fmtTokens(cacheWriteTok)):'';
-  const contextLabel=hasPostCompressionEstimate?'Estimated next model context':'Context window';
-  let label=hasPromptTok?`${contextLabel} ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
-  if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
+  // Every line of this tooltip is user-facing prose, so it goes through t()
+  // like the compress button below it did already. Half a translated tooltip
+  // is worse than an untranslated one.
+  const contextLabel=hasPostCompressionEstimate?t('ctx_next_model_label'):t('ctx_window_label');
+  let label=hasPromptTok?t('ctx_usage_aria',contextLabel,pct):t('ctx_tokens_used',_fmtTokens(totalTok));
+  if(!hasExplicitCtx&&hasPromptTok) label+=' '+t('ctx_est_window',`${Math.round(DEFAULT_CTX/1024)}K`);
   if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
   if(cacheText) label+=` \u00b7 ${cacheText}`;
   el.setAttribute('aria-label',label);
-  const usageText=hasPromptTok?(overflowed?`${contextLabel}: ${rawPct}% used (context exceeded)`:`${contextLabel}: ${pct}% used (${100-pct}% left)`):`${_fmtTokens(totalTok)} tokens used`;
-  const tokensText=hasPromptTok?`${contextLabel}: ${_fmtTokens(contextPromptTok)} / ${_fmtTokens(ctxWindow)} tokens used`:`In: ${_fmtTokens(usage.input_tokens||0)} \u00b7 Out: ${_fmtTokens(usage.output_tokens||0)}`;
+  const usageText=hasPromptTok?(overflowed?t('ctx_usage_exceeded',contextLabel,rawPct):t('ctx_usage_used',contextLabel,pct,100-pct)):t('ctx_tokens_used',_fmtTokens(totalTok));
+  const tokensText=hasPromptTok?t('ctx_tokens_of_window',contextLabel,_fmtTokens(contextPromptTok),_fmtTokens(ctxWindow)):t('ctx_in_out',_fmtTokens(usage.input_tokens||0),_fmtTokens(usage.output_tokens||0));
   if(usageLine) usageLine.textContent=usageText;
   if(tokensLine) tokensLine.textContent=tokensText;
   const threshold=usage.threshold_tokens||0;
   let thresholdText='';
   if(thresholdLine){
     if(threshold&&ctxWindow){
-      thresholdText=`Auto-compress at ${_fmtTokens(threshold)} (${Math.round(threshold/ctxWindow*100)}%)`;
+      thresholdText=t('ctx_auto_compress_at',_fmtTokens(threshold),Math.round(threshold/ctxWindow*100));
       thresholdLine.style.display='';
       thresholdLine.textContent=thresholdText;
     }else{
@@ -6990,7 +7046,7 @@ function _syncCtxIndicator(usage){
   let costText='';
   if(costLine){
     if(cost){
-      costText=`Estimated cost: $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
+      costText=t('ctx_estimated_cost',`$${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`);
       if(cacheText) costText+=` \u00b7 ${cacheText}`;
       costLine.style.display='';
       costLine.textContent=costText;

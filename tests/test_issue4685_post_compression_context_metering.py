@@ -1,40 +1,18 @@
-import json
-import subprocess
 from pathlib import Path
+
+from tests._ctx_indicator_harness import render_context_indicator
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def _run_context_indicator(usage):
-    source = (ROOT / "static" / "ui.js").read_text(encoding="utf-8")
-    start = source.index("function _syncCtxIndicator")
-    end = source.index("// ── Touch support: toggle context tooltip on tap", start)
-    indicator = source[start:end]
-    script = f"""
-const nodes = {{}};
-for (const id of ['ctxIndicatorWrap', 'ctxIndicator', 'ctxRingValue', 'ctxPercent', 'ctxTooltipUsage', 'ctxTooltipTokens', 'ctxTooltipThreshold', 'ctxTooltipCost', 'ctxTooltipCompress', 'ctxCompressBtn']) {{
-  nodes[id] = {{style: {{}}, classList: {{remove(){{}}, toggle(){{}}}}, removeAttribute(){{}}, setAttribute(name, value){{ this[name] = value; }}}};
-}}
-global.$ = id => nodes[id] || null;
-global.window = {{}};
-global._syncMobileCtxDisplay = () => {{}};
-global._setCtxCompressButton = () => {{}};
-global._fmtTokens = value => String(value);
-global.t = key => key;
-{indicator}
-_syncCtxIndicator({json.dumps(usage)});
-console.log(JSON.stringify({{percent: nodes.ctxPercent.textContent, label: nodes.ctxIndicator['aria-label'], usage: nodes.ctxTooltipUsage.textContent, tokens: nodes.ctxTooltipTokens.textContent}}));
-"""
-    result = subprocess.run(
-        ["node", "-e", script],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    return json.loads(result.stdout)
+    """Render the indicator with the real English strings.
+
+    The tooltip's lines are localized, so the harness resolves keys against the
+    English bundle in static/i18n.js rather than stubbing t() to echo key names.
+    """
+    return render_context_indicator(usage)
 
 
 def test_context_indicator_uses_post_compression_estimate():
