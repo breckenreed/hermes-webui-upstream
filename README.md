@@ -169,7 +169,7 @@ Two optional, self-hosted-deployment features — attaching dynamic **session-re
 
 The bootstrap will:
 
-1. Detect Hermes Agent and, if missing, attempt the official installer (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`).
+1. Detect Hermes Agent and, if missing, provision it from the official `nousresearch/hermes-agent` **container image** (`docker cp` out of a never-started container — nothing is installed on the host and no remote script is executed). The legacy host installer is reachable only by explicit opt-in: `./start.sh --agent-source host`. Pin the image with `HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:…`; see [Agent provisioning without a host install](docs/docker.md#agent-provisioning-without-a-host-install).
 2. Find or create a Python environment with the WebUI dependencies.
 3. Start the web server and wait for `/health`.
 4. Open the browser unless you pass `--no-browser`.
@@ -470,6 +470,8 @@ curl http://127.0.0.1:8787/health
 **Pre-built images** (amd64 + arm64) are published to GHCR on every release.
 
 For a comprehensive setup guide covering all 3 compose files, common failure modes, and bind-mount migration, see [`docs/docker.md`](docs/docker.md). The README covers the 5-minute happy path.
+
+> **Building the image yourself?** `./scripts/docker-build.sh --pin --verify` (Windows: `.\scripts\docker-build.ps1 -Pin -Verify`) builds it entirely inside containers: the Hermes Agent is taken from its official container image — never from a host install — and every dependency is resolved at build time into a root-owned venv the runtime user cannot modify. Details in [Hermetic, container-only build](docs/docker.md#hermetic-container-only-build).
 
 ### 5-minute quickstart (single container)
 

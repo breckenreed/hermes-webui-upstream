@@ -11,13 +11,41 @@
 # For multi-container setups (separate agent + webui or agent+webui+dashboard),
 # see docker-compose.two-container.yml or docker-compose.three-container.yml.
 
+# Explicit project name. Compose otherwise names the project after the
+# directory, so two checkouts that both happen to be called `hermes-webui`
+# would share one project and `up` from either would recreate the other's
+# containers. `-p` / COMPOSE_PROJECT_NAME still override this.
+name: hermes-webui-doc
+
 services:
   hermes-webui:
-    build: .
+    # Distinct image tag and container name for the same reason: nothing built
+    # or started from this checkout can be mistaken for the published
+    # ghcr.io/nesquena/hermes-webui image or another checkout's container.
+    image: hermes-webui-doc:latest
+    container_name: hermes-webui-doc
+    build:
+      context: .
+      args:
+        # The Hermes Agent is taken from its official CONTAINER IMAGE at build
+        # time — this setup never runs the agent's host installer. Pin the
+        # image by digest for a reproducible, auditable supply chain:
+        #   HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:<digest>
+        # `./scripts/docker-build.sh --pin` (PowerShell: -Pin) resolves the
+        # current tag to a digest for you.
+        HERMES_AGENT_IMAGE: ${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:latest}
+        # image = bake the agent in; none = supply it at runtime by a mount.
+        AGENT_SOURCE: ${AGENT_SOURCE:-image}
+        AGENT_EXTRAS: ${AGENT_EXTRAS:-all}
+        # 1 = resolve every dependency at build time into a root-owned venv the
+        # runtime user cannot write to. 0 = legacy install-at-container-start.
+        BAKE_RUNTIME: ${BAKE_RUNTIME:-1}
     ports:
-    # select only one; use 127.0.0.1 version to expose to localhost only
-      - "127.0.0.1:8787:8787"
-#      - "8787:8787"
+      # Host address to publish on. Default: loopback only. To reach the UI
+      # from other machines, set HERMES_WEBUI_BIND in .env to a specific
+      # interface address (e.g. your Tailscale IP, 100.x.y.z) rather than
+      # 0.0.0.0, and set HERMES_WEBUI_PASSWORD — the UI is plain HTTP.
+      - "${HERMES_WEBUI_BIND:-127.0.0.1}:8787:8787"
     volumes:
       # Mount your Hermes home directory into the container.
       # The default (${HOME}/.hermes) works on both macOS (/Users/<you>/.hermes)
@@ -55,4 +83,40 @@ services:
       #   world-readable. Both are documented in api/startup.py.
       # - HERMES_SKIP_CHMOD=1
       # - HERMES_HOME_MODE=0640
+      #
+      # Gateway daemon reachability (scheduled-job ticking, the System gateway
+      # pill). Leave unset when no separate gateway runs. When the agent runs in
+      # its own compose stack and publishes its API server, point at it, e.g. in
+      # .env:  HERMES_API_URL=http://host.docker.internal:8642
+      # The bearer key is taken from the shared ~/.hermes/.env (API_SERVER_KEY);
+      # set HERMES_WEBUI_GATEWAY_API_KEY only when the WebUI must use a
+      # different one.
+      - HERMES_API_URL=${HERMES_API_URL:-}
+      - HERMES_WEBUI_GATEWAY_API_KEY=${HERMES_WEBUI_GATEWAY_API_KEY:-}
+      #
+      # Where chat actually executes.
+      #
+      # Unset (default): the agent runs IN-PROCESS in this container. Every tool
+      # it uses must then exist HERE — including MCP servers, which means this
+      # container needs their interpreters (node/npx), their file paths, and
+      # their API keys. That spreads provider secrets into the WebUI.
+      #
+      # `gateway`: chat is forwarded to the agent's gateway over HTTP, so the
+      # agent container runs the MCP servers and keeps their credentials inside
+      # its own boundary. The WebUI holds no MCP secrets at all.
+      # USE_RUNS_API=true is required for approval cards on guarded tools.
+      # The bearer token falls back to API_SERVER_KEY from the shared
+      # ~/.hermes/.env, so no key needs duplicating into this container.
+      - HERMES_WEBUI_CHAT_BACKEND=${HERMES_WEBUI_CHAT_BACKEND:-}
+      - HERMES_WEBUI_GATEWAY_BASE_URL=${HERMES_WEBUI_GATEWAY_BASE_URL:-}
+      - HERMES_WEBUI_GATEWAY_USE_RUNS_API=${HERMES_WEBUI_GATEWAY_USE_RUNS_API:-}
+      # Provider secrets that ~/.hermes/config.yaml references as ${VAR}
+      # placeholders must exist in THIS container's environment too, or the
+      # agent (running in-process here) sends the literal placeholder to the
+      # provider. Set them in .env; unset values pass through as empty.
+      - LLM_CLIENT_UID=${LLM_CLIENT_UID:-}
+    extra_hosts:
+      # Makes host.docker.internal resolve on Linux engines too (Docker Desktop
+      # provides it by itself), so the HERMES_API_URL example above is portable.
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped

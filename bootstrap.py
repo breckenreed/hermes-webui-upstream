@@ -342,9 +342,16 @@ def ensure_python_has_webui_deps(python_exe: str, agent_dir: Path | None = None)
     if _python_can_run_webui_and_agent(str(venv_python), agent_dir):
         return str(venv_python)
     raise RuntimeError(
-        "Python environment cannot import both WebUI dependencies and Hermes Agent. "
-        "Set HERMES_WEBUI_PYTHON to the Hermes Agent venv Python or install the "
-        "WebUI requirements into that environment."
+        "Python environment cannot import both WebUI dependencies and Hermes Agent.\n"
+        "  - Set HERMES_WEBUI_PYTHON to the Hermes Agent venv Python, or install "
+        "the WebUI requirements into that environment.\n"
+        "  - An agent source provisioned from the container image "
+        "(--agent-source container) carries no host venv on its own: the agent's "
+        "own dependencies still have to exist in the interpreter above.\n"
+        "  - To avoid host installs entirely, run the WebUI in a container, where "
+        "both dependency sets are resolved at image build time:\n"
+        "      ./scripts/docker-build.sh --up      "
+        "(PowerShell: scripts\\docker-build.ps1 -Up)"
     )
 
 
@@ -353,6 +360,13 @@ def hermes_command_exists() -> bool:
 
 
 def install_hermes_agent() -> None:
+    """Run the agent's official host installer.
+
+    Opt-in only (``--agent-source host``). The default is
+    ``--agent-source container``, which takes the agent out of the pinned
+    hermes-agent container image instead of piping a remote script into a shell
+    on the user's machine. See ``provision_agent_from_container``.
+    """
     if platform.system() == "Windows" and not is_wsl():
         raise RuntimeError(
             "Auto-install is not supported on native Windows. "
@@ -362,6 +376,185 @@ def install_hermes_agent() -> None:
     subprocess.run(
         ["/bin/bash", "-lc", f"curl -fsSL {INSTALLER_URL} | bash"], check=True
     )
+
+
+# ── Agent provisioning from the hermes-agent container image ─────────────────
+# The bootstrap never installs the agent onto the host by default. The agent
+# comes out of one auditable, digest-pinnable container image, extracted with
+# `docker cp` — no remote script is executed on this machine.
+AGENT_IMAGE_DEFAULT = "nousresearch/hermes-agent:latest"
+# Where the agent's source tree lives inside that image.
+AGENT_IMAGE_SRC_PATH = "/opt/hermes"
+_AGENT_SOURCE_CONTAINER = "container"
+_AGENT_SOURCE_HOST = "host"
+_AGENT_SOURCE_NONE = "none"
+_VALID_AGENT_SOURCES = (
+    _AGENT_SOURCE_CONTAINER,
+    _AGENT_SOURCE_HOST,
+    _AGENT_SOURCE_NONE,
+)
+
+
+def agent_image() -> str:
+    """Container image the agent is provisioned from. Pin it by digest."""
+    return (os.getenv("HERMES_AGENT_IMAGE") or "").strip() or AGENT_IMAGE_DEFAULT
+
+
+def container_cli() -> str | None:
+    """Return a usable docker/podman CLI, or None.
+
+    A binary on PATH is not enough — a stopped Docker Desktop still leaves
+    `docker` there. Probe the daemon so the caller can fail with an accurate
+    message instead of a confusing subprocess error later.
+    """
+    override = (os.getenv("HERMES_WEBUI_CONTAINER_CLI") or "").strip()
+    candidates = [override] if override else ["docker", "podman"]
+    for name in candidates:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        try:
+            probe = subprocess.run(
+                [exe, "version", "--format", "{{.Server.Version}}"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0:
+            return exe
+    return None
+
+
+def agent_install_dir() -> Path:
+    """Where a container-provisioned agent source tree is written."""
+    explicit = (os.getenv("HERMES_WEBUI_AGENT_DIR") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+    return home / "hermes-agent"
+
+
+def _run_container_cli(
+    cli: str, args: list[str], *, capture: bool = False
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [cli, *args],
+        check=True,
+        text=True,
+        capture_output=capture,
+    )
+
+
+def provision_agent_from_container() -> Path:
+    """Extract the agent's source tree out of the hermes-agent image.
+
+    Nothing is installed on the host: the image is pulled, a container is
+    created but never started, its ``/opt/hermes`` is copied out, and the
+    container is removed. The extraction target must not already hold a tree —
+    this refuses rather than overwriting an existing checkout.
+    """
+    cli = container_cli()
+    if cli is None:
+        raise RuntimeError(
+            "Hermes Agent was not found and no working Docker/Podman daemon is "
+            "available to provision it from "
+            f"{agent_image()}.\n"
+            "  - Start Docker and re-run, or\n"
+            "  - run the WebUI itself in a container (recommended):\n"
+            "      ./scripts/docker-build.sh --up      (PowerShell: "
+            "scripts\\docker-build.ps1 -Up)\n"
+            "  - or opt in to the agent's host installer explicitly:\n"
+            "      ./start.sh --agent-source host"
+        )
+
+    image = agent_image()
+    target = agent_install_dir()
+    if target.exists() and any(target.iterdir()):
+        raise RuntimeError(
+            f"Refusing to overwrite the existing directory at {target}. "
+            "Point HERMES_WEBUI_AGENT_DIR at an empty path, or remove that "
+            "directory yourself if it is a stale extraction."
+        )
+
+    inspect = subprocess.run(
+        [cli, "image", "inspect", image],
+        capture_output=True,
+        text=True,
+    )
+    if inspect.returncode != 0:
+        info(f"Pulling the Hermes Agent image {image}")
+        _run_container_cli(cli, ["pull", image])
+    else:
+        info(f"Using the local Hermes Agent image {image}")
+
+    info(f"Extracting {image}:{AGENT_IMAGE_SRC_PATH} to {target}")
+    created = _run_container_cli(
+        cli, ["create", "--entrypoint", "/bin/true", image], capture=True
+    )
+    container_id = (created.stdout or "").strip().splitlines()[-1].strip()
+    if not container_id:
+        raise RuntimeError(f"{cli} create returned no container id for {image}")
+
+    staging = target.parent / f".{target.name}.incoming-{os.getpid()}"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        _run_container_cli(
+            cli,
+            ["cp", f"{container_id}:{AGENT_IMAGE_SRC_PATH}/.", str(staging)],
+        )
+        if not (staging / "run_agent.py").exists():
+            raise RuntimeError(
+                f"{image} does not carry an agent source tree at "
+                f"{AGENT_IMAGE_SRC_PATH} (no run_agent.py after extraction). "
+                "Check HERMES_AGENT_IMAGE."
+            )
+        # Only publish the tree once it is known-complete, so an interrupted
+        # extraction can never leave a half-populated agent dir behind that
+        # discover_agent_dir() would later accept.
+        if target.exists():
+            target.rmdir()
+        staging.replace(target)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        subprocess.run(
+            [cli, "rm", "-f", container_id],
+            capture_output=True,
+            text=True,
+        )
+
+    info(f"Hermes Agent source provisioned from {image} at {target}")
+    return target
+
+
+def resolve_agent_source(cli_value: str | None) -> str:
+    """Resolve the agent provisioning mode. Defaults to the container image."""
+    raw = (cli_value or os.getenv("HERMES_WEBUI_AGENT_SOURCE") or "").strip().lower()
+    if not raw:
+        return _AGENT_SOURCE_CONTAINER
+    if raw not in _VALID_AGENT_SOURCES:
+        raise RuntimeError(
+            f"Unknown agent source {raw!r}. "
+            f"Expected one of: {', '.join(_VALID_AGENT_SOURCES)}."
+        )
+    return raw
+
+
+def provision_agent(source: str) -> None:
+    """Provision the Hermes Agent using the resolved source."""
+    if source == _AGENT_SOURCE_NONE:
+        raise RuntimeError(
+            "Hermes Agent was not found and provisioning was disabled "
+            "(--agent-source none / --skip-agent-install)."
+        )
+    if source == _AGENT_SOURCE_HOST:
+        install_hermes_agent()
+        return
+    provision_agent_from_container()
 
 
 def _truthy(value: str | None) -> bool:
@@ -476,7 +669,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-agent-install",
         action="store_true",
-        help="Fail instead of attempting the official Hermes installer.",
+        help="Fail instead of provisioning the agent (same as --agent-source none).",
+    )
+    parser.add_argument(
+        "--agent-source",
+        choices=list(_VALID_AGENT_SOURCES),
+        default=None,
+        help=(
+            "Where a missing Hermes Agent comes from. 'container' (the default) "
+            "extracts it from the pinned hermes-agent container image — nothing "
+            "is installed on this machine and no remote script is executed. "
+            "'host' opts in to the agent's official installer "
+            f"({INSTALLER_URL}). 'none' fails instead of provisioning. "
+            "Also settable via HERMES_WEBUI_AGENT_SOURCE; the image is "
+            "HERMES_AGENT_IMAGE (default "
+            f"{AGENT_IMAGE_DEFAULT})."
+        ),
     )
     parser.add_argument(
         "--foreground",
@@ -567,7 +775,7 @@ def main() -> int:
             raise RuntimeError(
                 "Hermes Agent was not found and auto-install was disabled."
             )
-        install_hermes_agent()
+        provision_agent(resolve_agent_source(args.agent_source))
         agent_dir = discover_agent_dir()
 
     python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)

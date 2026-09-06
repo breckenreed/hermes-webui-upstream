@@ -56,9 +56,158 @@ UID/GID alignment and ownership preparation before the app can read `~/.hermes`,
 `hermeswebui` user and starts the server there. Init scratch files under `/tmp/hermeswebui_init`
 are owner-only (`0700` directory, `0600` files), not world-writable.
 
+Images built from this repository (as opposed to pulled) add a second layer: the WebUI's and the
+agent's Python dependencies are resolved at **build** time into `/opt/hermes-webui/venv`, and the
+agent's source is copied from its official container image into `/opt/hermes-agent`. Both trees stay
+root-owned and non-writable by `hermeswebui`, and the started container performs no installs and
+needs no package index. A process that gains a shell as `hermeswebui` therefore cannot rewrite the
+interpreter, the dependencies, or the agent code it runs. See
+[Hermetic, container-only build](#hermetic-container-only-build).
+
 For multi-tenant or hostile-container environments, rebuild with your own runtime user, mount policy,
 and supervisor assumptions. Development images that need package-manager convenience should add
 those tools in a dev-only Dockerfile instead of reintroducing passwordless sudo to production.
+
+## Hermetic, container-only build
+
+Building the image yourself gives you two properties the published tags cannot:
+the Hermes Agent enters the image from **one auditable container artifact**, and
+every Python dependency is resolved **at build time**, not on the first
+container start.
+
+```bash
+./scripts/docker-build.sh --pin --verify        # Linux / macOS / WSL
+```
+
+```powershell
+.\scripts\docker-build.ps1 -Pin -Verify         # Windows
+```
+
+Neither script touches the host beyond the Docker socket. No venv, no `pip`, no
+agent installer, no Node — the build itself runs in BuildKit, and the
+verification runs in a throwaway container.
+
+### What the build guarantees
+
+**The agent comes from the agent container image, never from a host install.**
+`Dockerfile` starts with `FROM ${HERMES_AGENT_IMAGE} AS agent-image` and copies
+`/opt/hermes` out of it. The agent's own installer
+(`curl … install.sh | bash`) is never executed — not during the image build, and
+not by `bootstrap.py` (see [Agent provisioning without a host install](#agent-provisioning-without-a-host-install)).
+`--pin` resolves the tag to an immutable digest first, so a rebuild either gets
+the same agent artifact or fails loudly:
+
+```bash
+./scripts/docker-build.sh --pin
+# [docker-build] Pinned agent image: nousresearch/hermes-agent@sha256:…
+```
+
+**Dependencies are baked, and the runtime user cannot rewrite them.** The WebUI's
+requirements and the agent's `[all]` extras are installed at build time into
+`/opt/hermes-webui/venv`, which stays root-owned and non-writable by
+`hermeswebui`. A started container installs nothing and needs no package index,
+so the code that serves requests is exactly the code that was reviewed at build
+time. `docker_init.bash` detects the baked venv and skips its entire install
+path. `--verify` asserts both properties against a running container:
+
+```
+[docker-build] baked venv is not writable by the runtime user
+agent import OK inside the container
+[docker-build] Boot smoke passed
+```
+
+**The build fails rather than deferring failure to the first chat.** The image
+build ends with an import gate (`import yaml, cryptography` plus
+`from run_agent import AIAgent`), mirroring `bootstrap.py`'s own probe. A green
+build means the runtime can actually import the agent.
+
+### Build arguments
+
+| Arg | Default | Meaning |
+|---|---|---|
+| `HERMES_AGENT_IMAGE` | `nousresearch/hermes-agent:latest` | Image the agent is taken from. Pin by digest. |
+| `AGENT_SOURCE` | `image` | `image` bakes the agent in; `none` builds a WebUI-only image whose agent is supplied at runtime by a mount. |
+| `AGENT_EXTRAS` | `all` | Agent extras to install. |
+| `AGENT_PRUNE_NODE_MODULES` | `1` | Drops the agent's `node_modules` (~376 MB of JS the Python server never loads). `0` keeps the tree whole. |
+| `BAKE_RUNTIME` | `1` | `0` falls back to the legacy install-at-container-start path, keeping the agent source at `/opt/hermes-agent`. |
+
+`docker-compose.yml` passes all of these through, so `docker compose build` and
+`docker compose up --build` produce the same hermetic image:
+
+```bash
+HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:… docker compose up -d --build
+```
+
+### Running the tests without a host toolchain
+
+```bash
+./scripts/docker-build.sh --test        # PowerShell: .\scripts\docker-build.ps1 -Test
+```
+
+The repo is copied into a throwaway container, `requirements-dev.txt` is
+installed *there*, and pytest runs against the baked venv. Nothing is written to
+the working tree and no dev dependency lands on the host. Extra pytest arguments
+go through `PYTEST_ARGS`; the full suite (~11,500 tests) is long in a single
+container, so slice it the way CI does:
+
+```bash
+PYTEST_ARGS="--shard-id=0 --num-shards=8" ./scripts/docker-build.sh --test
+```
+
+```powershell
+$env:PYTEST_ARGS = "--shard-id=0 --num-shards=8"; .\scripts\docker-build.ps1 -Test
+```
+
+### A lean image instead
+
+If you run the multi-container topology, where the agent lives in its own
+container and is shared as a volume, build without baking the agent in:
+
+```bash
+./scripts/docker-build.sh --lean        # PowerShell: .\scripts\docker-build.ps1 -Lean
+```
+
+That sets `AGENT_SOURCE=none` and points the agent build stage at an already-local
+base image, so the 1.2 GB agent image is never fetched.
+
+### Escape hatch
+
+`HERMES_WEBUI_DISABLE_BAKED_VENV=1` on the container forces the legacy
+install-at-startup path even on a baked image. Use it when you are mounting your
+own agent checkout over the baked one; `docker_init.bash` warns when a mounted
+agent source is being shadowed and tells you which switch to flip.
+
+## Agent provisioning without a host install
+
+`bootstrap.py` — the native (non-container) launcher behind `./start.sh` — no
+longer installs the Hermes Agent onto the machine it runs on. When no agent is
+found, the default `--agent-source container` extracts the agent's source tree
+out of the pinned container image with `docker cp`: the image is pulled, a
+container is created but **never started**, `/opt/hermes` is copied out, and the
+container is removed. No remote script is piped into a shell.
+
+```bash
+./start.sh                                   # container-sourced agent (default)
+HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:… ./start.sh
+./start.sh --agent-source none               # fail instead of provisioning
+./start.sh --agent-source host               # explicit opt-in to the host installer
+```
+
+`--agent-source host` is the only way to reach the official installer, and it
+still refuses to run on native Windows. `HERMES_WEBUI_AGENT_SOURCE` sets the same
+choice from the environment, and `HERMES_WEBUI_CONTAINER_CLI` selects `podman`
+over `docker`.
+
+Extraction is atomic: the tree is staged next to the target and published only
+once `run_agent.py` is present, so an interrupted pull cannot leave a
+half-populated agent directory that later looks valid. An existing non-empty
+target is refused rather than overwritten.
+
+> **Note:** a container-provisioned source tree carries no Python environment of
+> its own — the agent's dependencies still have to exist in whichever interpreter
+> `bootstrap.py` selects. If you want no host installs at all, run the WebUI in a
+> container instead, where both dependency sets are resolved at image build time.
+> `bootstrap.py` says exactly this when the import check fails.
 
 ## 5-minute quickstart (single container)
 
@@ -371,6 +520,29 @@ docker compose down && docker compose up -d
 On macOS, host UIDs start at 501. On Linux, the first interactive user is usually UID 1000.
 
 > **macOS Docker Desktop**: if UID mapping still misbehaves after the env fix, try toggling **Settings → General → File sharing implementation** between VirtioFS and gRPC-FUSE. Different implementations preserve UIDs across the host/container boundary differently.
+
+### 1b. Startup stalls for minutes after "Running as root for one-time container init" (Docker Desktop)
+
+The root init phase aligns ownership of `/home/hermeswebui` with a recursive
+`chown`. On Docker Desktop, a bind-mounted `~/.hermes` is a **host share**
+(`v9fs` on Windows, `cifs`/`smb` for network shares) where ownership is fixed by
+the mount — every file already reports the share's uid/gid and `chown` is a
+silent no-op. A real agent home (`node_modules`, `.venv`, npm caches — tens of
+thousands of files, one round trip each) therefore stalled startup for many
+minutes with nothing to show for it, and the container sat `unhealthy` with
+`find … -exec chown` in `docker top`.
+
+`docker_init.bash` now detects those filesystems with `stat -f` and skips the
+walk over the mount (the container-layer part of the home is still aligned),
+logging:
+
+```
+-- Skipping ownership walk of /home/hermeswebui/.hermes (… is a v9fs host share; ownership is fixed by the mount)
+```
+
+Force the same behaviour on any filesystem with `HERMES_SKIP_HOME_CHOWN=1`.
+This is unrelated to `HERMES_SKIP_CHMOD`, which controls the WebUI's
+credential-file *mode* fixer in `api/startup.py`.
 
 ### 2. ".env file mode 0640 → permission denied" (#1389)
 

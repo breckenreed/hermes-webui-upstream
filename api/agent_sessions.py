@@ -1,4 +1,5 @@
 """Shared helpers for reading Hermes Agent sessions from state.db."""
+import json
 import logging
 import sqlite3
 from contextlib import closing
@@ -1246,3 +1247,163 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             entry['_compression_segment_count'] = max(segment_count, tip_depth)
 
     return metadata
+
+
+def read_agent_transcript_rows(
+    db_path: Path,
+    session_id: str,
+    *,
+    limit: int = 4000,
+    log: logging.Logger | None = None,
+) -> list[dict]:
+    """Return one session's transcript from the agent's ``state.db``.
+
+    Rows come back in WebUI message shape (``role`` / ``content`` /
+    ``tool_calls`` / ``tool_call_id``) so callers can hand them straight to
+    ``api.streaming._extract_tool_calls_from_messages`` instead of reimplementing
+    tool-call pairing.
+
+    Why this exists: when chat runs through the Hermes Gateway, tool RESULTS
+    never cross the wire — the agent's ``tool_progress_callback`` contract
+    carries ``(event_type, tool_name, preview=None, args=None)`` on
+    ``tool.completed``, so the runs API can only report that a tool finished,
+    not what it returned. The agent does persist the full result to its own
+    ``state.db``, which multi-container deployments already share with the
+    WebUI, so the data is available locally — just not over the stream.
+
+    Read-only and best-effort: any failure returns ``[]`` and the caller keeps
+    whatever it had. A WebUI session id and its agent-side session id are the
+    same value, so no mapping table is involved.
+    """
+    log = log or logger
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+    try:
+        db_path = Path(db_path)
+    except TypeError:
+        return []
+    if not db_path.exists():
+        return []
+
+    try:
+        with closing(open_state_db_readonly(db_path, log)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if not {"role", "content", "session_id"} <= columns:
+                return []
+            select_cols = ["role", "content"]
+            for optional in ("tool_calls", "tool_call_id", "tool_name"):
+                if optional in columns:
+                    select_cols.append(optional)
+            rows = conn.execute(
+                f"SELECT {', '.join(select_cols)} FROM messages "
+                "WHERE session_id = ? ORDER BY id ASC LIMIT ?",
+                (sid, int(limit)),
+            ).fetchall()
+    except sqlite3.Error:
+        log.debug("Could not read agent transcript for %s", sid, exc_info=True)
+        return []
+    except Exception:
+        log.debug("Unexpected failure reading agent transcript for %s", sid, exc_info=True)
+        return []
+
+    messages: list[dict] = []
+    for row in rows:
+        record = dict(zip(select_cols, row))
+        role = str(record.get("role") or "").strip()
+        if not role:
+            continue
+        message: dict = {"role": role, "content": record.get("content") or ""}
+        raw_tool_calls = record.get("tool_calls")
+        if raw_tool_calls:
+            # Stored as a JSON array of OpenAI-shaped calls
+            # ({id, call_id, function:{name, arguments}}). Skip a malformed
+            # blob rather than dropping the whole transcript.
+            try:
+                parsed = json.loads(raw_tool_calls)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                message["tool_calls"] = parsed
+        if record.get("tool_call_id"):
+            message["tool_call_id"] = record["tool_call_id"]
+        messages.append(message)
+    return messages
+
+
+def read_agent_session_usage(
+    db_path: Path,
+    session_id: str,
+    *,
+    log: logging.Logger | None = None,
+) -> dict:
+    """Return cumulative token usage for one session from the agent's ``state.db``.
+
+    Same rationale as ``read_agent_transcript_rows``: a gateway run reports
+    per-response usage on the wire but nothing is written to the WebUI session,
+    so the context pill reads zero. The agent keeps authoritative per-session
+    totals in ``sessions``, which the WebUI already has read access to.
+
+    Returns only keys that are actually present and positive, so a caller can
+    ``dict.update`` without zeroing a value it already had. Missing row,
+    missing table or any error yields ``{}``.
+
+    Deliberately NOT returned: ``last_prompt_tokens`` and ``threshold_tokens``.
+    The size of the *current* context would need ``messages.token_count``, which
+    the agent leaves NULL, and the auto-compress threshold is computed by the
+    agent's compressor with caps this side cannot see. Showing a fabricated
+    percentage would be worse than showing none, so those stay unset and the UI
+    falls back to the cumulative "N tokens used" display.
+    """
+    log = log or logger
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        db_path = Path(db_path)
+    except TypeError:
+        return {}
+    if not db_path.exists():
+        return {}
+
+    # state.db column -> WebUI session attribute
+    wanted = {
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+        "cache_read_tokens": "cache_read_tokens",
+        "cache_write_tokens": "cache_write_tokens",
+        "estimated_cost_usd": "estimated_cost",
+    }
+    try:
+        with closing(open_state_db_readonly(db_path, log)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            present = [c for c in wanted if c in columns]
+            if not present:
+                return {}
+            row = conn.execute(
+                f"SELECT {', '.join(present)} FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+    except sqlite3.Error:
+        log.debug("Could not read agent session usage for %s", sid, exc_info=True)
+        return {}
+    except Exception:
+        log.debug("Unexpected failure reading agent session usage for %s", sid, exc_info=True)
+        return {}
+
+    if not row:
+        return {}
+
+    usage: dict = {}
+    for column, value in zip(present, row):
+        if value is None:
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number <= 0:
+            continue
+        target = wanted[column]
+        usage[target] = number if target == "estimated_cost" else int(number)
+    return usage

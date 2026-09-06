@@ -217,6 +217,34 @@ chown_home_hermeswebui() {
   # source — prune the entire hermes-agent path from the chown walk so a
   # read-only or partially-read-only mount doesn't break the rest of the home
   # ownership alignment.
+  #
+  # Docker Desktop exposes host directories over a 9p share (Windows: v9fs;
+  # cifs/smb for network shares). Ownership there is fixed by the mount: every
+  # file already reports the share's uid/gid and chown is a silent no-op. Walking
+  # a real ~/.hermes over such a share (node_modules, .venv, npm caches — tens of
+  # thousands of files, one round trip each) stalls startup for many minutes with
+  # nothing to show for it. When the filesystem cannot honour chown, or when the
+  # operator says so (HERMES_SKIP_HOME_CHOWN=1), align only the parts of
+  # /home/hermeswebui that live in the container's own layer.
+  _home_mount="/home/hermeswebui/.hermes"
+  _home_fstype="$(stat -f -c %T "$_home_mount" 2>/dev/null || echo unknown)"
+  _skip_reason=""
+  if [ "A${HERMES_SKIP_HOME_CHOWN:-}" == "A1" ]; then
+    _skip_reason="HERMES_SKIP_HOME_CHOWN=1"
+  else
+    case "$_home_fstype" in
+      v9fs|9p|cifs|smb2|smb3|drvfs)
+        _skip_reason="${_home_mount} is a ${_home_fstype} host share; ownership is fixed by the mount"
+        ;;
+    esac
+  fi
+  if [ -n "$_skip_reason" ]; then
+    echo "-- Skipping ownership walk of ${_home_mount} (${_skip_reason})"
+    find /home/hermeswebui \
+      -path "$_home_mount" -prune \
+      -o -exec chown -h "${WANTED_UID}:${WANTED_GID}" {} +
+    return
+  fi
   find /home/hermeswebui \
     -path "/home/hermeswebui/.hermes/hermes-agent" -prune \
     -o -name ".git" -prune \
@@ -374,6 +402,74 @@ else
 fi
 
 echo ""; echo "==================="
+
+######## Baked runtime (hermetic image build)
+#
+# When the image was built with BAKE_RUNTIME=1 (the default — see the "Baked
+# runtime" block in the Dockerfile), the WebUI's dependencies and the Hermes
+# Agent are already installed into a root-owned venv at
+# /opt/hermes-webui/venv, and the agent's source sits at /opt/hermes-agent,
+# taken from the official hermes-agent CONTAINER IMAGE at build time.
+#
+# In that case this container installs nothing and needs no network: no uv
+# download, no `uv pip install`, no writable staging copy of the agent source.
+# The runtime user cannot write to either tree, so the code that serves
+# requests is exactly the code that was reviewed when the image was built.
+#
+# Escape hatch: HERMES_WEBUI_DISABLE_BAKED_VENV=1 forces the legacy
+# install-at-startup path below, which is also what an image built with
+# BAKE_RUNTIME=0 or AGENT_SOURCE=none gets.
+_baked_venv="${HERMES_WEBUI_BAKED_VENV:-/opt/hermes-webui/venv}"
+_baked_agent_dir="${HERMES_WEBUI_BAKED_AGENT_DIR:-/opt/hermes-agent}"
+_mounted_agent_dir="/home/hermeswebui/.hermes/hermes-agent"
+
+if [ "A${HERMES_WEBUI_DISABLE_BAKED_VENV:-}" == "A1" ]; then
+  echo ""; echo "== HERMES_WEBUI_DISABLE_BAKED_VENV=1 — using the install-at-startup path"
+elif [ -x "${_baked_venv}/bin/python3" ]; then
+  echo ""; echo "== Baked runtime detected at ${_baked_venv} — no startup installs needed"
+
+  export VIRTUAL_ENV="${_baked_venv}"
+  export PATH="${_baked_venv}/bin:$PATH"
+  test -x "${_baked_venv}/bin/python3" || error_exit "Baked venv python is not executable"
+
+  # Defence in depth: the whole point of baking is that the unprivileged
+  # runtime user cannot rewrite its own dependencies. Warn loudly rather than
+  # failing, so a deliberately writable dev image still boots.
+  if [ -w "${_baked_venv}" ]; then
+    echo "!! WARNING: ${_baked_venv} is writable by $(id -un) — the baked runtime's"
+    echo "!!          tamper resistance is lost. Rebuild the image without"
+    echo "!!          overriding ownership of /opt/hermes-webui."
+  fi
+
+  # Point the server at the agent source that the baked venv actually installed.
+  if [ -f "${_baked_agent_dir}/pyproject.toml" ]; then
+    if [ -n "${HERMES_WEBUI_AGENT_DIR:-}" ] && [ "${HERMES_WEBUI_AGENT_DIR}" != "${_baked_agent_dir}" ]; then
+      echo "!! WARNING: HERMES_WEBUI_AGENT_DIR=${HERMES_WEBUI_AGENT_DIR} does not match the"
+      echo "!!          agent installed into the baked venv (${_baked_agent_dir})."
+      echo "!!          Imports resolve to ${_baked_agent_dir}; unset the variable, or set"
+      echo "!!          HERMES_WEBUI_DISABLE_BAKED_VENV=1 to install your own source at startup."
+    else
+      export HERMES_WEBUI_AGENT_DIR="${_baked_agent_dir}"
+    fi
+    echo "-- Hermes Agent source: ${_baked_agent_dir} (from the agent container image)"
+    if [ -d "${_mounted_agent_dir}" ] && [ -f "${_mounted_agent_dir}/pyproject.toml" ]; then
+      echo "!! WARNING: an agent source is also mounted at ${_mounted_agent_dir}."
+      echo "!!          The baked one wins. To use the mounted source instead, either set"
+      echo "!!          HERMES_WEBUI_DISABLE_BAKED_VENV=1, or rebuild the image with"
+      echo "!!          --build-arg AGENT_SOURCE=none."
+    fi
+  else
+    echo "!! WARNING: baked venv present but no agent source at ${_baked_agent_dir}."
+    echo "!! The WebUI will start with reduced functionality (no model auto-detection,"
+    echo "!! no personality routing, no CLI session imports)."
+  fi
+
+  echo ""; echo "== Running hermes-webui (baked runtime)"
+  cd /app || error_exit "Failed to enter /app"
+  python server.py || error_exit "hermes-webui failed or exited with an error"
+  ok_exit "Clean exit"
+fi
+
 echo ""; echo "== Installing uv and creating a new virtual environment for hermes-webui"
 
 export PATH="/home/hermeswebui/.local/bin/:$PATH"
@@ -428,6 +524,10 @@ else
   echo ""; echo "== Adding hermes-agent's pyproject.toml base dependencies to the virtual environment"
   _agent_paths=(
     "/home/hermeswebui/.hermes/hermes-agent"
+    # Baked into the image from the hermes-agent container image by the
+    # Dockerfile. Present when the image was built with BAKE_RUNTIME=0, which
+    # takes the agent from the container image but still installs at startup.
+    "/opt/hermes-agent"
     "/opt/hermes"
   )
   _agent_src=""

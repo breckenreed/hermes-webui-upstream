@@ -327,6 +327,46 @@ def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=Non
         return None
 
 
+def _gateway_tool_calls_from_agent_db(session_id: str) -> list:
+    """Rebuild a gateway turn's tool-call summaries from the agent's state.db.
+
+    A gateway run streams tool *names* but never tool RESULTS: the agent's
+    ``tool_progress_callback`` contract passes ``preview=None, args=None`` on
+    ``tool.completed`` (agent/tool_executor.py), so the runs API can report that
+    a tool finished but not what it returned. Without this, the WebUI renders
+    tool cards with an empty Output tab, and a failed tool shows no reason.
+
+    The result is not lost, only off-stream: the agent persists the full
+    transcript to its own ``state.db``, which multi-container deployments
+    already share with the WebUI, and a WebUI session id IS the agent-side
+    session id. So re-read it locally, then reuse
+    ``_extract_tool_calls_from_messages`` — the same builder the in-process path
+    uses — instead of a parallel pairing implementation that could drift.
+
+    Deliberately best-effort: any failure returns ``[]``, which is exactly the
+    value this call site passed before hydration existed. Reading is read-only
+    and never touches the agent's own credentials.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+    try:
+        from api.agent_sessions import read_agent_transcript_rows
+        from api.models import _agent_state_db_path
+        from api.streaming import _extract_tool_calls_from_messages
+
+        db_path = _agent_state_db_path()
+        if not db_path:
+            return []
+        rows = read_agent_transcript_rows(db_path, sid, log=logger)
+        if not rows:
+            return []
+        return _extract_tool_calls_from_messages(rows) or []
+    except Exception:
+        logger.debug("Gateway tool-call hydration failed for %s", sid, exc_info=True)
+        return []
+
+
 def _gateway_session_yolo_enabled(session_id: str) -> bool:
     """Return the WebUI-owned, in-memory YOLO state for a browser session."""
     try:
@@ -1095,7 +1135,10 @@ def _settle_gateway_terminal_error(session_id, stream_id, workspace, model, mode
         except Exception:
             logger.debug("Failed to persist gateway terminal error settlement", exc_info=True)
         error_payload["session"] = redact_session_data(
-            _session_payload_with_full_messages(session, tool_calls=[])
+            _session_payload_with_full_messages(
+                session,
+                tool_calls=_gateway_tool_calls_from_agent_db(session.session_id),
+            )
         )
         error_payload["session_id"] = session.session_id
         error_payload["terminal_session_persisted"] = terminal_session_persisted
@@ -1622,6 +1665,26 @@ def _run_gateway_chat_streaming(
             if cancel_event.is_set():
                 _restore_cancelled_success_writeback()
                 return
+            # Cumulative token usage for the context pill. A gateway run reports
+            # usage on the wire but writes none of it back to the session, so a
+            # gateway-only conversation showed "0 tokens used" while the agent's
+            # own state.db held the real totals. Same source as the tool-call
+            # hydration above; best-effort, and an empty result leaves every
+            # field exactly as it was.
+            try:
+                from api.agent_sessions import read_agent_session_usage
+                from api.models import _agent_state_db_path
+
+                _usage_db = _agent_state_db_path()
+                if _usage_db:
+                    for _usage_field, _usage_value in read_agent_session_usage(
+                        _usage_db, s.session_id, log=logger
+                    ).items():
+                        setattr(s, _usage_field, _usage_value)
+            except Exception:
+                logger.debug(
+                    "Gateway usage hydration failed for %s", s.session_id, exc_info=True
+                )
             clear_process_wakeup_pause(s, reason="run_completed")
             if cancel_event.is_set():
                 _restore_cancelled_success_writeback()
@@ -1681,7 +1744,9 @@ def _run_gateway_chat_streaming(
                 goal_exc,
             )
         from api.streaming import _session_payload_with_full_messages
-        gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
+        gateway_session_payload = _session_payload_with_full_messages(
+            s, tool_calls=_gateway_tool_calls_from_agent_db(s.session_id)
+        )
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
         # Announce the compression only once the job exists, so the frontend
         # polls a job that is already registered rather than racing it.
