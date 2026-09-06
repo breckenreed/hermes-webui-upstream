@@ -89,15 +89,20 @@ def test_gateway_sse_delta_extracts_openai_chat_chunks():
 
 
 def test_gateway_stream_usage_normalizes_token_names():
+    # last_prompt_tokens mirrors prompt_tokens: it is the size of the context
+    # actually submitted for this turn, which is what the context indicator
+    # divides by the model's window. See tests/test_gateway_context_metering.py.
     assert _gateway_stream_usage({"usage": {"prompt_tokens": 7, "completion_tokens": 3}}) == {
         "input_tokens": 7,
         "output_tokens": 3,
         "estimated_cost": 0,
+        "last_prompt_tokens": 7,
     }
     assert _gateway_stream_usage({"usage": {"input_tokens": 5, "output_tokens": 2, "estimated_cost_usd": 0.01}}) == {
         "input_tokens": 5,
         "output_tokens": 2,
         "estimated_cost": 0.01,
+        "last_prompt_tokens": 5,
     }
     assert _gateway_stream_usage({}) == {}
 
