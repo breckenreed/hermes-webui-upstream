@@ -441,6 +441,21 @@ console.log(JSON.stringify({
     return json.loads(r.stdout.strip().splitlines()[-1])
 
 
+class TestNoEntryPointGuard:
+    def test_does_not_open_when_no_entry_point_is_rendered(self):
+        """The guard test_issue1431 used to pin as a source string, proven.
+
+        toggleToolsetsDropdown() is global, so it can be called while every
+        trigger is hidden by responsive CSS. It must not open then: with no
+        rendered anchor the sheet would be positioned against a 0x0 rect.
+        """
+        out = _run("hidden")
+        assert out["open"] is False, (
+            f"picker must not open with no rendered entry point; got {out}"
+        )
+        assert out["openedBy"] is None, f"nothing may be marked active; got {out}"
+
+
 class TestPanelSheetLifecycle:
     def test_clicking_inside_the_sheet_keeps_the_panel_open(self):
         """The sheet is reparented to <body>, so it is no longer inside the panel.
