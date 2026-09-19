@@ -338,3 +338,151 @@ class TestToolsetsEntryPoints:
         assert out["inlineLeft"] == "44px", (
             f"desktop must keep the anchored footer-relative offset; got {out}"
         )
+
+
+# ── Panel / sheet lifecycle ──────────────────────────────────────────────────
+#
+# In `.cf-burger` the sheet is opened from an action that lives INSIDE the
+# mobile config panel, but the sheet itself is reparented to <body>. The two are
+# therefore no longer DOM relatives, and each one's dismiss logic has to know
+# about the other. These tests run the real slice of ui.js that owns the panel
+# lifecycle — `_syncMobileComposerConfigButton` through the toolsets Escape
+# handler — with `document.addEventListener` recording every listener, then
+# dispatch synthetic events at them.
+
+
+def _panel_slice(src: str) -> str:
+    start = src.index("function _syncMobileComposerConfigButton")
+    end = src.index("window.addEventListener('resize',function(){", start)
+    return src[start:end]
+
+
+def _run_lifecycle(scenario: str) -> dict:
+    src = UI_JS_PATH.read_text(encoding="utf-8")
+    payload = {"scenario": scenario, "slice": _panel_slice(src)}
+    js = "const params = " + json.dumps(payload) + ";\n" + r"""
+function makeEl(id) {
+  const cls = new Set();
+  const attrs = {};
+  return {
+    id,
+    classList: {
+      add: (c) => cls.add(c), remove: (c) => cls.delete(c),
+      contains: (c) => cls.has(c), toggle: (c, on) => (on ? cls.add(c) : cls.delete(c)),
+    },
+    setAttribute(k, v) { attrs[k] = v; }, getAttribute(k) { return attrs[k]; },
+    focus() { focused = id; },
+  };
+}
+let focused = null;
+const panel = makeEl('composerMobileConfigPanel');
+const btn = makeEl('composerMobileConfigBtn');
+const dd = makeEl('composerToolsetsDropdown');
+const action = makeEl('composerMobileToolsetsAction');
+const els = {
+  composerMobileConfigPanel: panel, composerMobileConfigBtn: btn,
+  composerToolsetsDropdown: dd, composerMobileToolsetsAction: action,
+};
+const $ = (id) => els[id] || null;
+
+const listeners = {};
+const document = {
+  addEventListener: (type, fn) => (listeners[type] = listeners[type] || []).push(fn),
+  getElementById: (id) => els[id] || null,
+};
+const window = {};
+
+let toolsetsClosed = 0;
+const closeToolsetsDropdown = () => { toolsetsClosed++; dd.classList.remove('open'); };
+const _activeToolsetsTrigger = () => action;
+const noop = () => {};
+
+// The slice's function declarations are scoped to this Function body; return
+// the one a scenario calls directly (the listeners already close over it).
+const api = new Function(
+  '$', 'document', 'window', 'closeToolsetsDropdown', '_activeToolsetsTrigger',
+  'closeWsDropdown', 'closeModelDropdown', 'closeReasoningDropdown', 'closeProfileDropdown',
+  params.slice + '\nreturn { closeMobileComposerConfig };'
+)($, document, window, closeToolsetsDropdown, _activeToolsetsTrigger, noop, noop, noop, noop);
+
+// A target whose `.closest(sel)` matches only the given container ids.
+const targetIn = (...ids) => ({ closest: (sel) => (ids.some((i) => sel === '#' + i) ? {} : null) });
+const fire = (type, evt) => (listeners[type] || []).forEach((fn) => fn(evt));
+const keyEvt = (key) => ({ key, preventDefault() {} });
+
+// Both surfaces open, as they are after tapping the Toolsets action in burger mode.
+panel.classList.add('open');
+dd.classList.add('open');
+
+if (params.scenario === 'click-inside-sheet') {
+  fire('click', { target: targetIn('composerToolsetsDropdown') });
+} else if (params.scenario === 'escape-with-panel') {
+  fire('keydown', keyEvt('Escape'));
+} else if (params.scenario === 'escape-without-panel') {
+  panel.classList.remove('open');   // .cf-icons: no panel involved
+  fire('keydown', keyEvt('Escape'));
+} else if (params.scenario === 'panel-closed-programmatically') {
+  // What the desktop resize handler does. Must NOT reach the toolsets picker,
+  // or an anchored desktop picker would close on every window resize.
+  api.closeMobileComposerConfig();
+}
+
+console.log(JSON.stringify({
+  panelOpen: panel.classList.contains('open'),
+  sheetOpen: dd.classList.contains('open'),
+  burgerExpanded: btn.getAttribute('aria-expanded') || null,
+  toolsetsClosed,
+  focused,
+}));
+"""
+    r = subprocess.run([NODE, "-e", js], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"node failed: {r.stderr}")
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+class TestPanelSheetLifecycle:
+    def test_clicking_inside_the_sheet_keeps_the_panel_open(self):
+        """The sheet is reparented to <body>, so it is no longer inside the panel.
+
+        Without whitelisting it, a click on a server checkbox counted as an
+        outside click for the panel, which tore the panel down behind the still
+        open sheet — leaving its in-panel anchor at 0x0 and the burger button
+        reporting aria-expanded="false" over a visibly open popup.
+        """
+        out = _run_lifecycle("click-inside-sheet")
+        assert out["panelOpen"] is True, f"panel must survive a click in the sheet; got {out}"
+        assert out["sheetOpen"] is True, f"the sheet must stay open too; got {out}"
+        assert out["burgerExpanded"] != "false", (
+            f"burger must not claim collapsed while its popup is open; got {out}"
+        )
+
+    def test_escape_with_the_panel_open_closes_both(self):
+        """Escape dismissed the panel but left the sheet anchored to a hidden action."""
+        out = _run_lifecycle("escape-with-panel")
+        assert out["panelOpen"] is False, f"Escape must close the panel; got {out}"
+        assert out["sheetOpen"] is False, f"Escape must also close the sheet; got {out}"
+
+    def test_escape_closes_the_sheet_when_there_is_no_panel(self):
+        """In `.cf-icons` there is no panel, and the sheet's only Escape binding
+        lived on a text field the floating sheet hides — so nothing could take
+        focus and Escape did nothing. Focus must return to the trigger."""
+        out = _run_lifecycle("escape-without-panel")
+        assert out["sheetOpen"] is False, f"Escape must close the sheet on its own; got {out}"
+        assert out["focused"] == "composerMobileToolsetsAction", (
+            f"focus must return to the trigger; got {out}"
+        )
+
+    def test_closing_the_panel_programmatically_leaves_the_picker_alone(self):
+        """closeMobileComposerConfig() is also called by the desktop resize handler.
+
+        Closing the toolsets picker from inside it would close an anchored
+        desktop picker on every window resize — a desktop behaviour change this
+        PR must not make. The panel's own dismiss paths close the sheet
+        explicitly instead.
+        """
+        out = _run_lifecycle("panel-closed-programmatically")
+        assert out["panelOpen"] is False, f"panel must close; got {out}"
+        assert out["toolsetsClosed"] == 0, (
+            f"closeMobileComposerConfig() must not reach the toolsets picker; got {out}"
+        )

@@ -5818,8 +5818,20 @@ function toggleToolsetsDropdown() {
   _positionToolsetsDropdown();
   trigger.classList.add('active');
   trigger.setAttribute('aria-expanded', 'true');
-  // Focus the input after a tick so the layout has settled
-  setTimeout(() => { const inp = $('toolsetsInput'); if (inp) inp.focus(); }, 50);
+  // Focus after a tick so the layout has settled. The floating sheet hides the
+  // free-text field, so focusing it was a silent no-op that left focus on the
+  // trigger — no keyboard path into the sheet. Land on the first actionable
+  // control instead; the profile-defaults button is rendered synchronously by
+  // _populateToolsetsDropdown(), so it is a safe fallback while the server
+  // catalog is still loading.
+  setTimeout(() => {
+    if (!dd.classList.contains('composer-toolsets-dropdown--floating')) {
+      const inp = $('toolsetsInput'); if (inp) inp.focus();
+      return;
+    }
+    const first = dd.querySelector('.toolsets-server-checkbox') || $('toolsetsProfileDefaultsBtn');
+    if (first && typeof first.focus === 'function') first.focus();
+  }, 50);
 }
 
 function closeToolsetsDropdown() {
@@ -5995,7 +6007,13 @@ document.addEventListener('click',function(e){
     e.target.closest('#composerMobileConfigPanel') ||
     e.target.closest('#composerWsDropdown') ||
     e.target.closest('#composerModelDropdown') ||
-    e.target.closest('#composerReasoningDropdown')
+    e.target.closest('#composerReasoningDropdown') ||
+    // Reparented to <body> when floating, like the three above — so a click on
+    // a server checkbox is no longer inside the panel. Without this, it tore the
+    // panel down behind the open sheet: the in-panel anchor went 0x0 (the next
+    // reposition snapped the sheet to the corner) and the burger button reported
+    // aria-expanded="false" while its popup was still visibly open.
+    e.target.closest('#composerToolsetsDropdown')
   ) return;
   closeMobileComposerConfig();
 });
@@ -6009,6 +6027,26 @@ document.addEventListener('keydown',function(e){
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
   closeReasoningDropdown();
+  // The toolsets sheet anchors to an action INSIDE this panel; closing the panel
+  // without it left the sheet open against a hidden anchor. Closed here rather
+  // than inside closeMobileComposerConfig(), which the desktop resize handler
+  // also calls — putting it there would close the anchored desktop picker on
+  // every window resize.
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+});
+
+// Escape for the toolsets picker itself. Its only previous Escape binding lived
+// on #toolsetsInput, which the floating sheet hides — so nothing could take
+// focus and Escape did nothing in .cf-icons, where there is no panel to close
+// either. Restores focus to the trigger so keyboard users are not dropped.
+document.addEventListener('keydown',function(e){
+  if(e.key!=='Escape') return;
+  const dd=$('composerToolsetsDropdown');
+  if(!dd||!dd.classList.contains('open')) return;
+  const trigger=typeof _activeToolsetsTrigger==='function'?_activeToolsetsTrigger():null;
+  e.preventDefault();
+  closeToolsetsDropdown();
+  if(trigger&&typeof trigger.focus==='function') trigger.focus();
 });
 
 window.addEventListener('resize',function(){
