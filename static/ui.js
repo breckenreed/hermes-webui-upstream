@@ -6023,6 +6023,11 @@ document.addEventListener('keydown',function(e){
   const panel=$('composerMobileConfigPanel');
   if(!panel||!panel.classList.contains('open')) return;
   e.preventDefault();
+  // Read BEFORE the dismissal below. This handler is registered ahead of the
+  // toolsets Escape handler, so once it closes the sheet that handler sees it
+  // already closed and skips its own focus restoration — this one has to do it.
+  const toolsetsDd=$('composerToolsetsDropdown');
+  const sheetWasOpen=!!(toolsetsDd&&toolsetsDd.classList.contains('open'));
   closeMobileComposerConfig();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
@@ -6033,6 +6038,13 @@ document.addEventListener('keydown',function(e){
   // also calls — putting it there would close the anchored desktop picker on
   // every window resize.
   if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+  // The trigger that opened the sheet lives inside the panel just closed, so it
+  // can no longer take focus. Hand focus to the burger button — the visible
+  // control that owns both surfaces — rather than dropping it onto <body>.
+  if(sheetWasOpen){
+    const burger=$('composerMobileConfigBtn');
+    if(burger&&typeof burger.focus==='function') burger.focus();
+  }
 });
 
 // Escape for the toolsets picker itself. Its only previous Escape binding lived
