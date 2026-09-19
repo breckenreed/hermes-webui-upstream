@@ -478,6 +478,21 @@ class TestPanelSheetLifecycle:
         assert out["panelOpen"] is False, f"Escape must close the panel; got {out}"
         assert out["sheetOpen"] is False, f"Escape must also close the sheet; got {out}"
 
+    def test_escape_from_the_panel_does_not_drop_keyboard_focus(self):
+        """Both Escape handlers fire on one keypress, in registration order.
+
+        The panel's handler runs first and closes the sheet too, so the
+        toolsets handler then sees it already closed and returns before its
+        focus restoration — leaving keyboard users on <body>. The trigger that
+        opened the sheet sits inside the panel that just closed and can no
+        longer take focus, so focus must land on the burger button, the visible
+        control that owns both surfaces.
+        """
+        out = _run_lifecycle("escape-with-panel")
+        assert out["focused"] == "composerMobileConfigBtn", (
+            f"focus must land on the burger button, not be dropped; got {out}"
+        )
+
     def test_escape_closes_the_sheet_when_there_is_no_panel(self):
         """In `.cf-icons` there is no panel, and the sheet's only Escape binding
         lived on a text field the floating sheet hides — so nothing could take
