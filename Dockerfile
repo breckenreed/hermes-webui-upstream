@@ -1,4 +1,68 @@
-FROM python:3.12-slim
+# ─────────────────────────────────────────────────────────────────────────────
+# Hermes WebUI — hermetic, container-only build.
+#
+# Two properties this file is responsible for:
+#
+#   1. The Hermes Agent enters this image ONLY from the official agent
+#      CONTAINER IMAGE below. Nothing here (and nothing in bootstrap.py) ever
+#      runs the agent's host installer (`curl … install.sh | bash`), so the
+#      agent's supply chain is exactly one auditable, digest-pinnable artifact.
+#
+#   2. Every dependency the server imports — the WebUI's own and the agent's —
+#      is resolved at BUILD time, inside the builder, into a root-owned venv
+#      the runtime user cannot write to. A started container needs no network
+#      and installs nothing, so the code that runs is exactly the code that
+#      was reviewed at build time.
+#
+# Build args (see scripts/docker-build.sh / scripts/docker-build.ps1):
+#   HERMES_AGENT_IMAGE        agent image to take the agent from. Pin it:
+#                             nousresearch/hermes-agent@sha256:<digest>
+#   AGENT_SOURCE              image (default) | none
+#                             `none` builds a WebUI-only image whose agent is
+#                             supplied at runtime by a mounted volume, the way
+#                             docker-compose.two-container.yml does it. Pair it
+#                             with HERMES_AGENT_IMAGE=python:3.12-slim so the
+#                             agent image is never fetched at all.
+#   AGENT_EXTRAS              agent extras to install (default: all)
+#   AGENT_PRUNE_NODE_MODULES  1 (default) drops the agent's node_modules — the
+#                             WebUI imports the agent as a Python library and
+#                             never runs its JS tooling. 0 keeps the tree whole.
+#   BAKE_RUNTIME              1 (default) bakes the venv. 0 falls back to the
+#                             legacy install-at-container-start path.
+# ─────────────────────────────────────────────────────────────────────────────
+ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent:latest
+ARG AGENT_SOURCE=image
+
+# The agent image itself. Referenced only by the alias below, so BuildKit never
+# fetches it when AGENT_SOURCE=none selects the empty stage instead.
+FROM ${HERMES_AGENT_IMAGE} AS agent-image
+
+# The "no agent baked in" alternative — an empty source tree.
+FROM python:3.12-slim AS agent-none
+RUN mkdir -p /opt/hermes
+
+# One of the two above, chosen by AGENT_SOURCE.
+FROM agent-${AGENT_SOURCE} AS agent-picked
+
+# ── Agent source, pruned ────────────────────────────────────────────────────
+# Pruning happens in its own stage so the discarded trees never reach a layer
+# of the final image. The exclusion set mirrors docker_init.bash's runtime
+# staging copy (egg-info / build / dist / __pycache__ / .git / .playwright)
+# and adds node_modules, which is ~376 MB of JS the Python server never loads.
+FROM python:3.12-slim AS agent-src
+ARG AGENT_PRUNE_NODE_MODULES=1
+COPY --from=agent-picked /opt/hermes /opt/hermes-agent
+RUN set -eu; \
+    cd /opt/hermes-agent; \
+    rm -rf .git .playwright build dist .pytest_cache; \
+    find . -name '*.egg-info' -prune -exec rm -rf {} + ; \
+    find . -type d -name '__pycache__' -prune -exec rm -rf {} + ; \
+    if [ "${AGENT_PRUNE_NODE_MODULES}" = "1" ]; then \
+        find . -type d -name 'node_modules' -prune -exec rm -rf {} + ; \
+    fi; \
+    echo "-- agent source staged: $(du -sh /opt/hermes-agent | cut -f1)"
+
+FROM python:3.12-slim AS runtime
 
 LABEL maintainer="nesquena"
 LABEL description="Hermes Web UI — browser interface for Hermes Agent"
@@ -138,6 +202,74 @@ COPY --chown=root:root . /apptoo
 # Local builds that omit the arg get "unknown" as the fallback.
 ARG HERMES_VERSION=unknown
 RUN echo "__version__ = '${HERMES_VERSION}'" > /apptoo/api/_version.py
+
+# ── Baked runtime ───────────────────────────────────────────────────────────
+# The agent's source and every Python dependency (WebUI + agent) are resolved
+# here, at build time, into /opt/hermes-webui/venv.
+#
+# Both trees stay root-owned and non-writable by hermeswebui. That is the
+# security property this build exists for: the unprivileged process that
+# handles requests cannot rewrite its own interpreter, its dependencies, or the
+# agent's code, and it never reaches a package index at run time. docker_init.bash
+# detects the baked venv and skips its whole install path — see the
+# "Baked runtime" branch there.
+ARG BAKE_RUNTIME=1
+ARG AGENT_EXTRAS=all
+ENV HERMES_WEBUI_BAKED_VENV=/opt/hermes-webui/venv
+ENV HERMES_WEBUI_BAKED_AGENT_DIR=/opt/hermes-agent
+
+COPY --from=agent-src /opt/hermes-agent /opt/hermes-agent
+
+RUN set -eu; \
+    if [ "${BAKE_RUNTIME}" != "1" ]; then \
+        echo "== BAKE_RUNTIME=0 — no baked venv; the container installs at startup (legacy path)"; \
+        echo "== The agent source stays at /opt/hermes-agent; docker_init.bash installs from it."; \
+        chown -R root:root /opt/hermes-agent 2>/dev/null || true; \
+        chmod -R a+rX,go-w /opt/hermes-agent 2>/dev/null || true; \
+        exit 0; \
+    fi; \
+    export UV_CACHE_DIR=/tmp/uv-build-cache; \
+    export UV_LINK_MODE=copy; \
+    _py="${HERMES_WEBUI_BAKED_VENV}/bin/python"; \
+    echo "== Creating the baked virtual environment at ${HERMES_WEBUI_BAKED_VENV}"; \
+    uv venv --python "$(command -v python3)" "${HERMES_WEBUI_BAKED_VENV}"; \
+    uv pip install --python "$_py" --no-cache pip setuptools wheel; \
+    echo "== Installing hermes-webui dependencies"; \
+    uv pip install --python "$_py" -r /apptoo/requirements.txt; \
+    echo "== Installing the Hindsight memory provider client"; \
+    uv pip install --python "$_py" "hindsight-client>=0.4.22"; \
+    if [ -f /opt/hermes-agent/pyproject.toml ]; then \
+        echo "== Installing the Hermes Agent from the agent container image"; \
+        uv pip install --python "$_py" -e "/opt/hermes-agent[${AGENT_EXTRAS}]"; \
+    else \
+        echo "!! No agent source in this build (AGENT_SOURCE=none)."; \
+        echo "!! Mount an agent source volume at /home/hermeswebui/.hermes/hermes-agent,"; \
+        echo "!! as docker-compose.two-container.yml does, or the WebUI starts with"; \
+        echo "!! reduced functionality."; \
+        rm -rf /opt/hermes-agent; \
+    fi; \
+    rm -rf /tmp/uv-build-cache; \
+    chown -R root:root /opt/hermes-webui; \
+    chmod -R a+rX,go-w /opt/hermes-webui; \
+    if [ -d /opt/hermes-agent ]; then \
+        chown -R root:root /opt/hermes-agent; \
+        chmod -R a+rX,go-w /opt/hermes-agent; \
+    fi
+
+# Fail the build — not the first user request — when the baked runtime cannot
+# import what the server needs. This mirrors bootstrap.py's
+# _python_can_run_webui_and_agent() probe: a green build means chat works, not
+# just that the image assembled. Skipped when nothing was baked.
+RUN set -eu; \
+    _py="${HERMES_WEBUI_BAKED_VENV}/bin/python"; \
+    if [ ! -x "$_py" ]; then \
+        echo "-- No baked venv to verify (BAKE_RUNTIME=0)"; \
+        exit 0; \
+    fi; \
+    "$_py" -c "import yaml, cryptography; print('-- webui deps OK')"; \
+    if [ -f /opt/hermes-agent/pyproject.toml ]; then \
+        "$_py" -c "from run_agent import AIAgent; print('-- hermes-agent import OK')"; \
+    fi
 
 # Default to binding all interfaces (required for container networking)
 ENV HERMES_WEBUI_HOST=0.0.0.0

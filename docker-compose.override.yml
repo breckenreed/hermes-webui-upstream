@@ -1,0 +1,20 @@
+# Vault bind for the in-process agent. Not tracked upstream — this checkout's
+# docker-compose.yml stays clean so it can be updated without conflicts.
+#
+# Why this is needed here at all: the sibling deployment (DEV/hermes-webui)
+# runs `docker exec hermes-agent hermes ...`, so its sessions execute inside
+# the hermes-agent container, which already binds the vault at
+# /host/opser-local. THIS checkout runs the agent in-process in its own
+# container, which only ever got ~/.hermes and ${HERMES_WORKSPACE}. Moving to
+# it therefore moved execution away from the mount — nothing broke, the agent
+# just left the container that had it.
+#
+# Mounted at /host/opser-local, matching hermes-agent, rather than repointing
+# HERMES_WORKSPACE: both containers share the same ~/.hermes, so a vault path
+# written down anywhere resolves identically in either one instead of drifting
+# apart depending on which UI happens to be serving 8787.
+services:
+  hermes-webui:
+    volumes:
+      - C:/Users/Administrator/Documents/opser/opser-local:/host/opser-local:rw
+
