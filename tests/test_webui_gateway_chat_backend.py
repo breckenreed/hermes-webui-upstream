@@ -1702,9 +1702,14 @@ def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test
     )
     if out is not None:
         out["done_usage"] = None
+        # Event names in wire order: the compress_started announcement has to
+        # land between "done" and "stream_end", so order is part of what
+        # callers assert, not just presence.
+        out["events"] = []
         while not subscriber.empty():
             item = subscriber.get_nowait()
             event, data = item[0], item[1]
+            out["events"].append(event)
             if event == "done":
                 out["done_usage"] = (data or {}).get("usage")
     return captured.get("body", "")
@@ -2013,3 +2018,182 @@ def test_gateway_that_never_sends_last_prompt_tokens_still_gets_a_ring_numerator
     # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
     # What is unique here is the done event: the ring reads it, not the session,
     # on a session's first turn.
+
+
+# ── The 75% context ceiling ──────────────────────────────────────────────────
+
+
+def _ceiling_env(monkeypatch, status="running"):
+    """Make the ceiling's two external dependencies available and observable.
+
+    Returns the list of compression-start bodies the trigger actually sent.
+    The agent bundle is stubbed because `import agent.context_compressor`
+    is the trigger's own guard and is absent from checkouts without it - the
+    parent package has to be bound too, or the import statement still fails.
+    """
+    import sys
+    from unittest.mock import MagicMock
+
+    import api.routes as routes
+
+    calls = []
+
+    def fake_start(handler, body):
+        calls.append(dict(body))
+        handler.wfile.write(
+            json.dumps({"status": status, "session_id": body["session_id"]}).encode()
+        )
+
+    monkeypatch.setitem(sys.modules, "agent", MagicMock())
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", MagicMock())
+    monkeypatch.setattr(routes, "_handle_session_compress_start", fake_start)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    return calls
+
+
+def test_ceiling_fires_at_the_step_where_the_ring_turns_red(monkeypatch):
+    """75% is where the ring goes red and offers the manual button, so that is
+    also where the automatic ceiling acts - one number, not two."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 75_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert calls == [{"session_id": "sid"}]
+
+
+def test_below_the_ceiling_nothing_is_compressed(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 74_999}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_a_repeat_at_the_same_size_does_not_summarize_again(monkeypatch):
+    """Compression may legitimately report "unchanged". Without this guard a
+    context that cannot shrink is re-summarized after every single turn."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert len(calls) == 1, "the same prompt size must not trigger twice"
+
+    # It grew despite the attempt - that is a new situation, so try again.
+    usage = {"context_length": 100_000, "last_prompt_tokens": 95_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert len(calls) == 2
+
+
+def test_the_ceiling_is_configurable_and_zero_turns_it_off(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 60_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    cfg = {"webui_auto_compress_pct": 50}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, cfg) is True
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000},
+        {"webui_auto_compress_pct": 0},
+    ) is False
+    assert len(calls) == 1
+
+
+def test_an_unknown_window_or_numerator_never_triggers(monkeypatch):
+    """Without both numbers there is no ratio, and a guess would compress a
+    context that may be nowhere near full."""
+    calls = _ceiling_env(monkeypatch)
+    for usage in (
+        {"last_prompt_tokens": 900_000},                       # no window
+        {"context_length": 100_000},                           # no numerator
+        {"context_length": 100_000, "last_prompt_tokens": float("inf")},
+        {"context_length": float("nan"), "last_prompt_tokens": 90_000},
+        {"context_length": 100_000, "last_prompt_tokens": "lots"},
+    ):
+        gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+        assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_no_local_compressor_means_no_compression_attempt(monkeypatch):
+    """A WebUI deployed without the agent bundle can still talk to a gateway.
+    Failing a job on every turn above the ceiling would be worse than leaving
+    the context alone."""
+    import sys
+
+    import api.routes as routes
+
+    started = []
+    monkeypatch.setattr(
+        routes, "_handle_session_compress_start",
+        lambda handler, body: started.append(body),
+    )
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", None)
+    monkeypatch.setitem(sys.modules, "agent", None)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000}, {},
+    ) is False
+    assert started == []
+
+
+def test_a_refused_job_is_not_recorded_as_an_attempt(monkeypatch):
+    """The endpoint refuses while a session is still streaming (409). That is
+    not "already handled at this size" - the next turn must be free to retry."""
+    calls = _ceiling_env(monkeypatch, status="error")
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER == {}
+    assert len(calls) == 1
+
+
+def test_tooltip_threshold_states_the_figure_the_ceiling_enforces(monkeypatch):
+    """The "Auto-compress at X" line must not be a lookalike constant that can
+    drift away from the number actually acted on."""
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 100_000) == 75_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 60}, 100_000) == 60_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 0}, 100_000) == 0
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 0) == 0
+    # Junk in config must not disable the ceiling silently.
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": "nonsense"}) == 75
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": 400}) == 100
+
+
+def test_a_turn_above_the_ceiling_announces_compression_on_the_stream(
+    tmp_path, monkeypatch
+):
+    """End-to-end: the frontend resumes the job off a compress_started event,
+    so the event must actually reach the stream - and only after the job is
+    registered, or the browser polls a job that does not exist yet.
+
+    This also pins that the ceiling sees a numerator at all: the fallback in
+    _run_gateway_chat_streaming is what supplies it, since no Hermes agent
+    sends last_prompt_tokens.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    calls = _ceiling_env(monkeypatch)
+
+    s = new_session()
+    s.context_length = 100_000
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":90000,"completion_tokens":100}',
+        out=out,
+    )
+    assert calls == [{"session_id": s.session_id}], (
+        "a turn ending at 90% of a 100k window must admit a compression job"
+    )
+    assert out["events"].index("compress_started") > out["events"].index("done"), (
+        "announced after done, so the job is registered before the browser resumes it"
+    )
+    assert out["events"].index("compress_started") < out["events"].index("stream_end")
