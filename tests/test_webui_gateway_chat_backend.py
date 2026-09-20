@@ -1702,9 +1702,14 @@ def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test
     )
     if out is not None:
         out["done_usage"] = None
+        # Event names in wire order: the compress_started announcement has to
+        # land between "done" and "stream_end", so order is part of what
+        # callers assert, not just presence.
+        out["events"] = []
         while not subscriber.empty():
             item = subscriber.get_nowait()
             event, data = item[0], item[1]
+            out["events"].append(event)
             if event == "done":
                 out["done_usage"] = (data or {}).get("usage")
     return captured.get("body", "")
@@ -2013,3 +2018,284 @@ def test_gateway_that_never_sends_last_prompt_tokens_still_gets_a_ring_numerator
     # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
     # What is unique here is the done event: the ring reads it, not the session,
     # on a session's first turn.
+
+
+# ── The 75% context ceiling ──────────────────────────────────────────────────
+
+
+def _ceiling_env(monkeypatch, status="running"):
+    """Make the ceiling's two external dependencies available and observable.
+
+    Returns the list of compression-start bodies the trigger actually sent.
+    The agent bundle is stubbed because `import agent.context_compressor`
+    is the trigger's own guard and is absent from checkouts without it - the
+    parent package has to be bound too, or the import statement still fails.
+    """
+    import sys
+    from unittest.mock import MagicMock
+
+    import api.routes as routes
+
+    calls = []
+
+    def fake_start(handler, body):
+        calls.append(dict(body))
+        handler.wfile.write(
+            json.dumps({"status": status, "session_id": body["session_id"]}).encode()
+        )
+
+    monkeypatch.setitem(sys.modules, "agent", MagicMock())
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", MagicMock())
+    monkeypatch.setattr(routes, "_handle_session_compress_start", fake_start)
+    # The outcome watcher runs in its own thread and sleeps between polls;
+    # it has its own test below rather than a real one inside every case.
+    monkeypatch.setattr(gateway_chat, "_watch_gateway_compression", lambda *a, **kw: None)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    return calls
+
+
+def test_ceiling_fires_at_the_step_where_the_ring_turns_red(monkeypatch):
+    """75% is where the ring goes red and offers the manual button, so that is
+    also where the automatic ceiling acts - one number, not two."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 75_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert calls == [{"session_id": "sid"}]
+
+
+def test_below_the_ceiling_nothing_is_compressed(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 74_999}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_a_repeat_at_the_same_size_does_not_summarize_again(monkeypatch):
+    """Compression may legitimately report "unchanged". Without this guard a
+    context that cannot shrink is re-summarized after every single turn."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert len(calls) == 1, "the same prompt size must not trigger twice"
+
+    # It grew despite the attempt - that is a new situation, so try again.
+    usage = {"context_length": 100_000, "last_prompt_tokens": 95_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert len(calls) == 2
+
+
+def test_the_ceiling_is_configurable_and_zero_turns_it_off(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 60_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    cfg = {"webui_auto_compress_pct": 50}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, cfg) is True
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000},
+        {"webui_auto_compress_pct": 0},
+    ) is False
+    assert len(calls) == 1
+
+
+def test_an_unknown_window_or_numerator_never_triggers(monkeypatch):
+    """Without both numbers there is no ratio, and a guess would compress a
+    context that may be nowhere near full."""
+    calls = _ceiling_env(monkeypatch)
+    for usage in (
+        {"last_prompt_tokens": 900_000},                       # no window
+        {"context_length": 100_000},                           # no numerator
+        {"context_length": 100_000, "last_prompt_tokens": float("inf")},
+        {"context_length": float("nan"), "last_prompt_tokens": 90_000},
+        {"context_length": 100_000, "last_prompt_tokens": "lots"},
+    ):
+        gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+        assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_no_local_compressor_means_no_compression_attempt(monkeypatch):
+    """A WebUI deployed without the agent bundle can still talk to a gateway.
+    Failing a job on every turn above the ceiling would be worse than leaving
+    the context alone."""
+    import sys
+
+    import api.routes as routes
+
+    started = []
+    monkeypatch.setattr(
+        routes, "_handle_session_compress_start",
+        lambda handler, body: started.append(body),
+    )
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", None)
+    monkeypatch.setitem(sys.modules, "agent", None)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000}, {},
+    ) is False
+    assert started == []
+
+
+def test_a_refused_job_is_not_recorded_as_an_attempt(monkeypatch, caplog):
+    """The endpoint refuses while a session is still streaming (409). That is
+    not "already handled at this size" - the next turn must be free to retry,
+    and the refusal has to be legible or the ceiling looks like it never ran."""
+    import logging
+
+    calls = _ceiling_env(monkeypatch, status="error")
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    with caplog.at_level(logging.WARNING, logger="api.gateway_chat"):
+        assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER == {}
+    assert len(calls) == 1
+    assert "refused" in caplog.text, "the endpoint's refusal must reach the log"
+
+
+def test_a_ceiling_that_does_nothing_says_so_out_loud(monkeypatch, caplog):
+    """A silent ceiling and a broken one look identical from outside.
+
+    Nothing in this application configures logging - no basicConfig, no
+    handlers - so Python's last-resort handler emits WARNING and above and
+    silently drops INFO and DEBUG. Reporting the ceiling's work at INFO
+    reported it into a void, which is how "it never fired" and "we cannot see
+    it fire" stayed indistinguishable across two deploys. The ordinary
+    outcomes are logged at WARNING deliberately; this test pins that, so a
+    later tidy-up to INFO has to argue with it rather than quietly re-blind
+    the thing.
+    """
+    import logging
+
+    _ceiling_env(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="api.gateway_chat"):
+        # The exact shape of the live failure: a numerator that never arrived.
+        assert gateway_chat.maybe_autocompress_gateway_session(
+            "sid", {"context_length": 100_000}, {}) is False
+    assert "inert" in caplog.text, "an inert ceiling must be visible at WARNING"
+    assert "last_prompt" in caplog.text, "and must name the value that was missing"
+    assert "context_length" in caplog.text, "and the keys it did have, to place the blame"
+
+
+def test_the_job_watcher_reports_how_compression_ended(monkeypatch, caplog):
+    """Admitted is not finished, and the difference has to be legible.
+
+    The ceiling logged STARTED twice against the live deployment - at 96.6%
+    and at 113% of a 100k window - and the context did not move either time.
+    Nothing connected those two ends: the compression job runs in its own
+    thread, so its outcome is never returned to the caller, and a job that
+    dies quietly looked exactly like one that worked.
+    """
+    import logging
+
+    import api.routes as routes
+
+    states = iter([
+        {"status": "running"},
+        {"status": "error", "error": "compressor unavailable"},
+    ])
+
+    def fake_status(handler, sid):
+        handler.wfile.write(json.dumps(next(states)).encode())
+
+    monkeypatch.setattr(routes, "_handle_session_compress_status", fake_status)
+    with caplog.at_level(logging.WARNING, logger="api.gateway_chat"):
+        gateway_chat._watch_gateway_compression("sid", poll=0, limit=30)
+
+    assert "'running'" in caplog.text, "the job's states must be reported as they change"
+    assert "'error'" in caplog.text, "and the terminal state above all"
+    assert "compressor unavailable" in caplog.text, "with the reason the endpoint gave"
+
+
+def test_tooltip_threshold_states_the_figure_the_ceiling_enforces(monkeypatch):
+    """The "Auto-compress at X" line must not be a lookalike constant that can
+    drift away from the number actually acted on."""
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 100_000) == 75_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 60}, 100_000) == 60_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 0}, 100_000) == 0
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 0) == 0
+    # Junk in config must not disable the ceiling silently.
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": "nonsense"}) == 75
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": 400}) == 100
+
+
+def test_a_turn_above_the_ceiling_announces_compression_on_the_stream(
+    tmp_path, monkeypatch
+):
+    """End-to-end: the frontend resumes the job off a compress_started event,
+    so the event must actually reach the stream - and only after the job is
+    registered, or the browser polls a job that does not exist yet.
+
+    This also pins that the ceiling sees a numerator at all: the fallback in
+    _run_gateway_chat_streaming is what supplies it, since no Hermes agent
+    sends last_prompt_tokens.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    calls = _ceiling_env(monkeypatch)
+
+    s = new_session()
+    s.context_length = 100_000
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":90000,"completion_tokens":100}',
+        out=out,
+    )
+    assert calls == [{"session_id": s.session_id}], (
+        "a turn ending at 90% of a 100k window must admit a compression job"
+    )
+    assert out["events"].index("done") < len(out["events"]), "the turn still completes normally"
+
+
+def test_the_ceiling_still_runs_when_the_turn_never_reaches_its_tail(tmp_path, monkeypatch):
+    """The bug this placement exists for.
+
+    Three `cancel_event.is_set()` checks return straight out of the function
+    just after the success writeback, and any exception past that point skips
+    the rest too. Every one of those paths is silent - this function logs only
+    at DEBUG - so a ceiling sitting after the "done" event simply never ran,
+    and nothing said so. Live evidence: a turn persisted
+    last_prompt_tokens=94330 against a 100k window, the ring drew 94%, and the
+    ceiling was not called once.
+
+    Simulated here by making the done event's own payload builder raise, which
+    is the cheapest way to reach the teardown without a completed tail. The
+    session writeback has already happened at that point, so the numerator the
+    ceiling needs is on disk - which is the whole reason the teardown can
+    decide correctly.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    calls = _ceiling_env(monkeypatch)
+
+    def _no_tail(*a, **kw):
+        raise RuntimeError("turn abandoned before the done event")
+
+    monkeypatch.setattr(gateway_chat, "redact_session_data", _no_tail)
+
+    s = new_session()
+    s.context_length = 100_000
+    s.save()
+
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s, '{"prompt_tokens":90000,"completion_tokens":100}',
+    )
+    assert calls == [{"session_id": s.session_id}], (
+        "a turn that ends above the ceiling must compress even when its tail "
+        "was skipped - otherwise the ceiling only works on turns that never "
+        "needed rescuing"
+    )

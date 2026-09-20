@@ -553,6 +553,221 @@ def _gateway_stream_usage(payload: dict) -> dict:
     return out
 
 
+# ── The context ceiling ──────────────────────────────────────────────────────
+#
+# An in-process turn hands compaction to the agent's own ContextCompressor. A
+# gateway turn builds no agent, and the Hermes agent behind the gateway does
+# not compact on the WebUI's behalf either: sessions here have been observed
+# at 108% and 154% of the model's window with nothing acting on them. So a
+# gateway session had no ceiling at all - the ring could sit deep in the red
+# and the turn would just keep growing until the provider refused it.
+#
+# 75 is the step where the ring turns red and offers the manual button, so the
+# automatic ceiling and the visible warning are the same number.
+_GATEWAY_AUTO_COMPRESS_PCT_DEFAULT = 75
+
+# session_id -> the prompt size that last triggered an attempt. Compression is
+# allowed to report "unchanged"; without this a context that cannot shrink
+# would be summarized again after every single turn.
+_GATEWAY_AUTO_COMPRESS_LAST_TRIGGER: dict[str, int] = {}
+
+# Every outcome below is logged at WARNING, including the ordinary ones.
+#
+# That is not severity inflation, it is the only visible level: nothing in
+# this application configures logging - no basicConfig, no handlers - so
+# Python's last-resort handler applies and emits WARNING and above to stderr,
+# and nothing else. A ceiling that reports its work at INFO reports it into a
+# void, which is how "it never fired" and "we cannot see it fire" stayed
+# indistinguishable through two deploys and one wrong conclusion.
+#
+# One line per gateway turn is the price. If this ever moves upstream behind
+# real logging config, the ordinary outcomes belong at INFO or DEBUG.
+_CEILING_LOG = "Gateway context ceiling — %s"
+
+
+def _gateway_count(value) -> int:
+    """Coerce a reported token count to a usable int, or 0.
+
+    Same trust boundary as _first_int() inside _gateway_stream_usage, hoisted
+    to module scope for the ceiling's own reads. OverflowError matters here:
+    int(float("inf")) raises it, and an uncaught one would abort the turn
+    after it had already completed.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number < 0:
+        return 0
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def gateway_auto_compress_pct(cfg) -> int:
+    """Percent of the window that triggers auto-compression; 0 disables it.
+
+    Overridable with ``webui_auto_compress_pct`` in config.yaml.
+    """
+    raw = cfg.get("webui_auto_compress_pct") if isinstance(cfg, dict) else None
+    if raw is None:
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    try:
+        pct = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    return max(0, min(100, pct))
+
+
+def gateway_auto_compress_threshold_tokens(cfg, context_length) -> int:
+    """The token count the ceiling lands on for this window, or 0."""
+    window = _gateway_count(context_length)
+    pct = gateway_auto_compress_pct(cfg)
+    if not window or not pct:
+        return 0
+    return int(round(window * pct / 100))
+
+
+def _watch_gateway_compression(session_id: str, *, poll: float = 5.0, limit: float = 1800.0) -> None:
+    """Report how the ceiling's job ended, not just that it began.
+
+    Starting a job and never saying how it finished is what made the previous
+    failure unreadable: the ceiling logged STARTED twice, the context did not
+    move either time, and nothing connected the two ends. The job runs in its
+    own thread, so its outcome has to be collected rather than returned.
+
+    Polls the same status endpoint the browser polls, and logs each change of
+    state once.
+    """
+    deadline = time.time() + limit
+    seen = None
+    while time.time() < deadline:
+        time.sleep(poll)
+        try:
+            from api.routes import _handle_session_compress_status, _ManualCompressionMemoryHandler
+
+            handler = _ManualCompressionMemoryHandler()
+            _handle_session_compress_status(handler, session_id)
+            payload = handler.payload()
+        except Exception:
+            logger.warning(
+                _CEILING_LOG % "status poll raised for %s", session_id, exc_info=True,
+            )
+            return
+        status = (payload or {}).get("status")
+        if status != seen:
+            seen = status
+            # The payload also carries the summary text; only the outcome and
+            # any failure reason are logged, never the conversation content.
+            detail = (payload or {}).get("error") or (payload or {}).get("message") or ""
+            logger.warning(
+                _CEILING_LOG % "job for %s is %r%s",
+                session_id, status, f" - {detail}" if detail else "",
+            )
+        if status and status != "running":
+            return
+    logger.warning(
+        _CEILING_LOG % "job for %s still running after %.0fs; stopped watching",
+        session_id, limit,
+    )
+
+
+def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -> bool:
+    """Start a compression job when the finished turn sat above the ceiling.
+
+    Runs the same job the composer's "compress now" button starts, so the
+    guards, the status endpoint, the transcript marker and the running card
+    are all the existing ones. Returns whether a job was admitted.
+
+    Reads the numerator from ``usage`` rather than the session because that is
+    the value the ring itself is drawn from - if the ceiling fired on anything
+    else, the ring and the ceiling could disagree about the same turn.
+    """
+    pct = gateway_auto_compress_pct(cfg)
+    if not pct or not session_id:
+        return False
+    window = _gateway_count((usage or {}).get("context_length"))
+    prompt_tokens = _gateway_count((usage or {}).get("last_prompt_tokens"))
+    if not window or not prompt_tokens:
+        # Loud on purpose. Without both numbers the ceiling does nothing, and
+        # from outside that is indistinguishable from "the context was fine" -
+        # which is exactly the hole this function fell into once already. The
+        # raw values and the available keys are what say WHY.
+        logger.warning(
+            _CEILING_LOG % "inert: window=%r last_prompt=%r for %s (usage keys: %s)",
+            (usage or {}).get("context_length"),
+            (usage or {}).get("last_prompt_tokens"),
+            session_id,
+            ",".join(sorted((usage or {}).keys())) or "none",
+        )
+        return False
+    ratio = prompt_tokens * 100 / window
+    if prompt_tokens * 100 < window * pct:
+        logger.warning(
+            _CEILING_LOG % "below ceiling: %s/%s tokens (%.1f%% < %s%%) for %s",
+            prompt_tokens, window, ratio, pct, session_id,
+        )
+        return False
+    if prompt_tokens <= _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.get(session_id, 0):
+        # Already attempted at this size and the context did not come down.
+        # Wait until it actually grows again.
+        logger.warning(
+            _CEILING_LOG % "already attempted at %s tokens for %s; waiting for growth",
+            prompt_tokens, session_id,
+        )
+        return False
+    try:
+        # Compression runs in this process against the local agent bundle. A
+        # WebUI deployed without it can still talk to a gateway, and there the
+        # honest answer is to leave the context alone rather than fail a job
+        # on every turn above the ceiling.
+        import agent.context_compressor  # noqa: F401
+    except Exception:
+        logger.warning(
+            _CEILING_LOG % "no local compressor, leaving context alone (session %s)",
+            session_id,
+        )
+        return False
+    try:
+        from api.routes import _handle_session_compress_start, _ManualCompressionMemoryHandler
+
+        handler = _ManualCompressionMemoryHandler()
+        _handle_session_compress_start(handler, {"session_id": session_id})
+        payload = handler.payload()
+    except Exception:
+        logger.warning(
+            _CEILING_LOG % "compression start raised for %s", session_id, exc_info=True,
+        )
+        return False
+    started = isinstance(payload, dict) and payload.get("status") == "running"
+    if started:
+        _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER[session_id] = prompt_tokens
+        logger.warning(
+            _CEILING_LOG % "STARTED for session %s (%s of %s tokens, %.1f%% >= %s%%)",
+            session_id, prompt_tokens, window, ratio, pct,
+        )
+        # Admitted is not finished. Collect the outcome so a job that dies
+        # quietly cannot look the same as one that worked.
+        try:
+            threading.Thread(
+                target=_watch_gateway_compression, args=(session_id,), daemon=True,
+            ).start()
+        except Exception:
+            logger.warning(
+                _CEILING_LOG % "could not watch the job for %s", session_id, exc_info=True,
+            )
+    else:
+        # The endpoint refused. Its own payload carries the reason - a 409 for
+        # a session still streaming, a 404, a stale-runtime barrier.
+        logger.warning(
+            _CEILING_LOG % "start refused for %s -> %r", session_id, payload,
+        )
+    return started
+
+
 def _gateway_reasoning_delta(payload: dict) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -1582,9 +1797,16 @@ def _run_gateway_chat_streaming(
                 # clobbered it with this fabricated default. api/models.py's
                 # Session defaults threshold_tokens to None, so check identity
                 # against that instead of truthiness against 0.
+                #
+                # The number comes from the same knob the ceiling enforces, so
+                # the tooltip's "Auto-compress at X" states the figure this
+                # path actually acts on rather than a lookalike constant that
+                # could drift away from it.
                 _gw_cl_now = getattr(s, "context_length", 0) or 0
                 if _gw_cl_now > 0 and getattr(s, "threshold_tokens", None) is None:
-                    s.threshold_tokens = int(_gw_cl_now * 0.75)
+                    _gw_ceiling = gateway_auto_compress_threshold_tokens(cfg, _gw_cl_now)
+                    if _gw_ceiling:
+                        s.threshold_tokens = _gw_ceiling
             except Exception:
                 pass
 
@@ -1684,6 +1906,9 @@ def _run_gateway_chat_streaming(
         except Exception:
             pass
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
+        # The ceiling used to be checked here. It is in the teardown instead -
+        # see the comment there - because this line is not reached on every
+        # turn, which is precisely how it went unnoticed that it never ran.
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
         try:
@@ -1703,6 +1928,22 @@ def _run_gateway_chat_streaming(
             "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
         })
     finally:
+        # The ceiling is checked here, in the teardown, and not after the
+        # "done" event where it naturally belongs.
+        #
+        # The tail of a gateway turn is not reliably reached. Three
+        # `cancel_event.is_set()` checks return straight out of the function
+        # just after the success writeback, and any exception past that point
+        # jumps here too - and every one of those paths is silent, because
+        # this function logs exclusively at DEBUG. Observed live: a turn
+        # persisted last_prompt_tokens=94330 against a 100k window, the ring
+        # drew 94%, and the ceiling was never called at all.
+        #
+        # The teardown runs in every one of those cases, and by the time it
+        # does the numerator and the window are already persisted on the
+        # session - which is also exactly what the ring reads after a reload,
+        # so the two cannot disagree. Placed before the STREAMS pop below, so
+        # the announcement still has a channel to go out on.
         mapped_run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
         if mapped_run_id:
             try:
@@ -1736,3 +1977,43 @@ def _run_gateway_chat_streaming(
         # the process lifetime (compare-and-clear: only clears if still owned by
         # this stream, mirroring the local streaming teardown).
         clear_session_writeback_owner_if_owned(session_id, stream_id)
+
+        # The ceiling is checked here: the last statement of the teardown,
+        # which itself runs on every path out of a turn.
+        #
+        # Not after the "done" event, where it reads like it belongs - three
+        # `cancel_event.is_set()` checks return straight out of the function
+        # just past the success writeback, and any exception jumps here too.
+        # All of those paths are silent, so a ceiling sitting up there simply
+        # never ran: observed live at 96.6% and again at 113% of a 100k
+        # window, with the call never reached once.
+        #
+        # And not merely at the top of the teardown either. Everything above
+        # this line releases the turn's claims on the session - the pending
+        # state, the stream registry, the run markers, and the writeback owner
+        # on the line right before this one. Compression rewrites the session,
+        # so it is admitted only once this turn has let go of it completely.
+        #
+        # By now the numerator and the window are persisted, and they are the
+        # same values the ring reads after a reload, so the two cannot
+        # disagree about a turn.
+        try:
+            try:
+                _ceiling_cfg = cfg
+            except NameError:
+                # Raised if we never reached get_config(); the ceiling falls
+                # back to its own default rather than skipping the turn.
+                _ceiling_cfg = None
+            _ceiling_session = get_session(session_id)
+            maybe_autocompress_gateway_session(
+                session_id,
+                {
+                    "context_length": getattr(_ceiling_session, "context_length", 0) or 0,
+                    "last_prompt_tokens": getattr(_ceiling_session, "last_prompt_tokens", 0) or 0,
+                },
+                _ceiling_cfg,
+            )
+        except Exception:
+            logger.warning(
+                _CEILING_LOG % "teardown check raised for %s", session_id, exc_info=True,
+            )
