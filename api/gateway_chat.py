@@ -1462,10 +1462,13 @@ def _run_gateway_chat_streaming(
             # terminal SSE chunk already carries it; the agent is fresh per
             # request, so this is the turn's total and accumulates.
             # Read the per-turn prompt size BEFORE the loop below rewrites
-            # usage["input_tokens"] into the lifetime total. The tool-free
-            # fallback further down needs this turn's slice; handing it the
-            # cumulative sum makes the context ring climb every turn, which is
-            # the exact regression #1436 introduced last_prompt_tokens to stop.
+            # usage["input_tokens"] into the lifetime total. The fallback
+            # further down needs this turn's slice; handing it the cumulative
+            # sum makes the context ring climb every turn, which is the exact
+            # regression #1436 introduced last_prompt_tokens to stop.
+            _turn_prompt_tokens = usage.get("input_tokens") or 0
+            if isinstance(_turn_prompt_tokens, bool) or not isinstance(_turn_prompt_tokens, (int, float)):
+                _turn_prompt_tokens = 0
             for _uk in (
                 "input_tokens",
                 "output_tokens",
@@ -1489,12 +1492,11 @@ def _run_gateway_chat_streaming(
             # Context-ring fields (ui.js #1436). Numerator: the gateway sums
             # usage across the turn's API calls, so it equals the real prompt
             # size ONLY on a tool-free turn; on a 3-call tool turn it triples
-            # and would light the red "compress now" nag. Hence the gate below.
-            # ponytail: tool turns keep the previous (stale) numerator, and a
-            # tool-using first turn gets none at all - under-reporting, which is
-            # always safe here (never a false nag). Reading the compressor's own
-            # last_prompt_tokens from the gateway process is the real fix and
-            # supersedes this heuristic.
+            # and would light the red "compress now" nag. Reading the
+            # compressor's own last_prompt_tokens from the gateway process is
+            # the real fix and supersedes the estimate - but no Hermes agent
+            # sends it (see below), so the estimate has to stand in rather
+            # than leave the ring with nothing to divide.
             try:
                 # The gateway reports the compressor's own last_prompt_tokens -
                 # the single most recent real prompt, correct on tool turns too
@@ -1502,21 +1504,41 @@ def _run_gateway_chat_streaming(
                 # an explicit 0 (the compressor's post-compaction clamp) - do not
                 # fall back to a heuristic when the wire value is there.
                 #
-                # An older gateway that omits the key entirely leaves this
-                # branch untaken and the previous numerator stands. There used
-                # to be a tool-free fallback here keyed on "no tool-progress
-                # events observed for this stream_id" - but an empty
-                # STREAM_LIVE_TOOL_CALLS entry only proves no progress events
-                # were *received*; a gateway/proxy that doesn't emit them can
-                # still have run multiple tool calls, and this side has no
-                # authoritative per-turn call count to tell the difference. A
-                # confidently wrong numerator is worse than a stale one, so an
-                # absent key now leaves last_prompt_tokens/threshold_tokens
-                # untouched rather than guess.
+                # A gateway that omits the key leaves this branch untaken, and
+                # the fallback below supplies the numerator instead. That is
+                # not a rare legacy case: a Hermes agent never sends the field
+                # on EITHER of its API paths. The whole wire contract of the
+                # runs API is gateway/platforms/api_server_runs.py::
+                # _USAGE_FIELDS - input/output/total tokens, plus the two cache
+                # counters since agent 0.21.3 - and chat/completions reports
+                # the same session counters. Checked against 0.21.0 and 0.21.3;
+                # neither mentions last_prompt_tokens anywhere.
+                #
+                # The fallback that used to live here was keyed on "no
+                # tool-progress events observed for this stream_id", and that
+                # gate was rightly removed: an empty STREAM_LIVE_TOOL_CALLS
+                # entry only proves no progress events were *received*. The
+                # gate is not restored - only the fallback, unconditionally.
                 if "last_prompt_tokens" in usage:
                     _gw_wire = usage.get("last_prompt_tokens") or 0
                     if isinstance(_gw_wire, (int, float)):
                         s.last_prompt_tokens = int(_gw_wire)
+                elif _turn_prompt_tokens > 0:
+                    # This turn's prompt slice, read before the loop above made
+                    # usage["input_tokens"] cumulative.
+                    #
+                    # The gateway sums usage across the turn's API calls, so on
+                    # a tool turn this overstates the real prompt and can nag
+                    # early. That cost is real, but the alternative is not a
+                    # better number - it is NO number: with the numerator unset
+                    # ui.js drops to lifetime in+out, which climbs every turn
+                    # and is not a share of the window at all. An occasional
+                    # early nag that self-corrects on the next tool-free turn
+                    # beats a permanently meaningless ring.
+                    s.last_prompt_tokens = int(_turn_prompt_tokens)
+                    # On a session's first turn the ring reads the done event,
+                    # not the session - see the backfill block further down.
+                    usage["last_prompt_tokens"] = int(_turn_prompt_tokens)
                 if "threshold_tokens" in usage:
                     _gw_thresh = usage.get("threshold_tokens") or 0
                     if isinstance(_gw_thresh, (int, float)):
