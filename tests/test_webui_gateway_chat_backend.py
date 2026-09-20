@@ -2223,6 +2223,49 @@ def test_a_turn_above_the_ceiling_announces_compression_on_the_stream(
         "a turn ending at 90% of a 100k window must admit a compression job"
     )
     assert out["events"].index("compress_started") > out["events"].index("done"), (
-        "announced after done, so the job is registered before the browser resumes it"
+        "announced after the turn's own events, so the job is registered before "
+        "the browser is told to resume it"
     )
-    assert out["events"].index("compress_started") < out["events"].index("stream_end")
+
+
+def test_the_ceiling_still_runs_when_the_turn_never_reaches_its_tail(tmp_path, monkeypatch):
+    """The bug this placement exists for.
+
+    Three `cancel_event.is_set()` checks return straight out of the function
+    just after the success writeback, and any exception past that point skips
+    the rest too. Every one of those paths is silent - this function logs only
+    at DEBUG - so a ceiling sitting after the "done" event simply never ran,
+    and nothing said so. Live evidence: a turn persisted
+    last_prompt_tokens=94330 against a 100k window, the ring drew 94%, and the
+    ceiling was not called once.
+
+    Simulated here by making the done event's own payload builder raise, which
+    is the cheapest way to reach the teardown without a completed tail. The
+    session writeback has already happened at that point, so the numerator the
+    ceiling needs is on disk - which is the whole reason the teardown can
+    decide correctly.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    calls = _ceiling_env(monkeypatch)
+
+    def _no_tail(*a, **kw):
+        raise RuntimeError("turn abandoned before the done event")
+
+    monkeypatch.setattr(gateway_chat, "redact_session_data", _no_tail)
+
+    s = new_session()
+    s.context_length = 100_000
+    s.save()
+
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s, '{"prompt_tokens":90000,"completion_tokens":100}',
+    )
+    assert calls == [{"session_id": s.session_id}], (
+        "a turn that ends above the ceiling must compress even when its tail "
+        "was skipped - otherwise the ceiling only works on turns that never "
+        "needed rescuing"
+    )

@@ -1852,13 +1852,9 @@ def _run_gateway_chat_streaming(
         except Exception:
             pass
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
-        # After "done", so the ceiling reads the same usage the ring was just
-        # drawn from, and after s.active_stream_id was cleared above - the
-        # compression endpoint refuses a session that is still streaming.
-        # Announced only once the job is registered, so the frontend resumes a
-        # job that exists rather than racing it.
-        if maybe_autocompress_gateway_session(session_id, usage, cfg):
-            put_gateway_event("compress_started", {"session_id": session_id, "automatic": True})
+        # The ceiling used to be checked here. It is in the teardown instead -
+        # see the comment there - because this line is not reached on every
+        # turn, which is precisely how it went unnoticed that it never ran.
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
         try:
@@ -1878,6 +1874,45 @@ def _run_gateway_chat_streaming(
             "hint": "Check HERMES_WEBUI_GATEWAY_BASE_URL and Gateway API server health.",
         })
     finally:
+        # The ceiling is checked here, in the teardown, and not after the
+        # "done" event where it naturally belongs.
+        #
+        # The tail of a gateway turn is not reliably reached. Three
+        # `cancel_event.is_set()` checks return straight out of the function
+        # just after the success writeback, and any exception past that point
+        # jumps here too - and every one of those paths is silent, because
+        # this function logs exclusively at DEBUG. Observed live: a turn
+        # persisted last_prompt_tokens=94330 against a 100k window, the ring
+        # drew 94%, and the ceiling was never called at all.
+        #
+        # The teardown runs in every one of those cases, and by the time it
+        # does the numerator and the window are already persisted on the
+        # session - which is also exactly what the ring reads after a reload,
+        # so the two cannot disagree. Placed before the STREAMS pop below, so
+        # the announcement still has a channel to go out on.
+        try:
+            try:
+                _ceiling_cfg = cfg
+            except NameError:
+                # Raised before get_config(); the ceiling falls back to its
+                # own default rather than skipping the turn.
+                _ceiling_cfg = None
+            _ceiling_session = get_session(session_id)
+            if maybe_autocompress_gateway_session(
+                session_id,
+                {
+                    "context_length": getattr(_ceiling_session, "context_length", 0) or 0,
+                    "last_prompt_tokens": getattr(_ceiling_session, "last_prompt_tokens", 0) or 0,
+                },
+                _ceiling_cfg,
+            ):
+                put_gateway_event(
+                    "compress_started", {"session_id": session_id, "automatic": True}
+                )
+        except Exception:
+            logger.warning(
+                _CEILING_LOG % "teardown check raised for %s", session_id, exc_info=True,
+            )
         mapped_run_id = str(_STREAM_RUN_IDS.get(stream_id) or "").strip()
         if mapped_run_id:
             try:
