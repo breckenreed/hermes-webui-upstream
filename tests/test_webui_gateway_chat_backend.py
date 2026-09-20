@@ -346,15 +346,19 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert saved.messages[0]["timestamp"] < saved.messages[1]["timestamp"]
     assert saved.active_stream_id is None
     # Provider-reported usage must reach the session record; it persisted 0 for
-    # every gateway-backed session before this. last_prompt_tokens stays unset:
-    # gateway usage is summed across the turn's API calls, so it is a billing
-    # total, not the context size ui.js needs for the gauge (#1436).
+    # every gateway-backed session before this.
     assert saved.input_tokens == 4
     assert saved.output_tokens == 2
-    # The fixture is a TOOL turn, so the gate deliberately leaves the context
-    # numerator unset: gateway usage is summed across the turn's API calls and
-    # would over-report the prompt size. Tool-free turns do set it.
-    assert not getattr(saved, "last_prompt_tokens", 0)
+    # The fixture is a TOOL turn, and this is the known cost of the fallback:
+    # gateway usage is summed across the turn's API calls, so on a tool turn
+    # the numerator over-reports the real prompt size. It is accepted rather
+    # than gated, because the gate that could tell a tool turn apart was
+    # unreliable and no Hermes agent sends the authoritative value - see the
+    # CONTRACT CHANGE note on
+    # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    # Over-reporting nags early and self-corrects; the alternative was a ring
+    # that never worked at all.
+    assert saved.last_prompt_tokens == 4
     assert stream_id not in STREAMS
     assert captured["url"] == "http://gateway.local/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
@@ -1698,26 +1702,39 @@ def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test
     )
     if out is not None:
         out["done_usage"] = None
+        # Event names in wire order: the compress_started announcement has to
+        # land between "done" and "stream_end", so order is part of what
+        # callers assert, not just presence.
+        out["events"] = []
         while not subscriber.empty():
             item = subscriber.get_nowait()
             event, data = item[0], item[1]
+            out["events"].append(event)
             if event == "done":
                 out["done_usage"] = (data or {}).get("usage")
     return captured.get("body", "")
 
 
 def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_path, monkeypatch):
-    """An older gateway that never sends last_prompt_tokens must leave the
-    context-ring numerator alone across turns - never let it drift to the
-    cumulative billing total (regression #1436 originally introduced
-    last_prompt_tokens to stop this exact failure mode).
+    """A gateway that never sends last_prompt_tokens must never let the
+    context-ring numerator drift to the cumulative billing total - regression
+    #1436 introduced last_prompt_tokens to stop this exact failure mode.
 
-    This used to be guarded by a tool-free heuristic keyed on
-    STREAM_LIVE_TOOL_CALLS being empty, which a maintainer re-gate flagged as
-    unreliable: an empty list only proves no tool-progress events were
-    *received*, not that no tools ran, on a gateway/proxy that omits those
-    optional events (defect #3). The fix removes the guess entirely - absent
-    means untouched, full stop.
+    CONTRACT CHANGE. This test used to assert the numerator stayed None while
+    the field was absent, on the premise that absence is an older gateway's
+    edge case. It is not: a Hermes agent never sends the field on either API
+    path (gateway/platforms/api_server_runs.py::_USAGE_FIELDS is the whole
+    terminal contract - input/output/total tokens plus, since 0.21.3, the two
+    cache counters; chat/completions reports the same session counters).
+    Checked against 0.21.0 and 0.21.3. "Absent means untouched" therefore
+    means "no numerator, ever", and static/ui.js falls through to lifetime
+    in+out - which is #1436 itself, arrived at from the other direction.
+
+    So the numerator is now this turn's prompt slice. What this test actually
+    guards is unchanged and still holds: it must never become the lifetime
+    sum. The tool-free gate keyed on an empty STREAM_LIVE_TOOL_CALLS is NOT
+    restored - that inference really was unreliable, since an empty list only
+    proves no tool-progress events were received.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -1726,18 +1743,19 @@ def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
 
     s = new_session()
-    # No last_prompt_tokens on the wire at all: an older gateway.
+    # No last_prompt_tokens on the wire at all: every Hermes agent.
     _run_gateway_turn(tmp_path, monkeypatch, s, '{"prompt_tokens":1000,"completion_tokens":10}')
     saved = models.get_session(s.session_id)
-    assert saved.last_prompt_tokens is None, "no wire signal means no numerator, not a guess"
+    assert saved.last_prompt_tokens == 1000, "this turn's prompt slice stands in for the wire value"
     assert saved.input_tokens == 1000, "the billing total still accumulates independently"
 
     _run_gateway_turn(tmp_path, monkeypatch, saved, '{"prompt_tokens":1200,"completion_tokens":10}')
     saved = models.get_session(s.session_id)
     assert saved.input_tokens == 2200, "billing total keeps accumulating"
-    assert saved.last_prompt_tokens is None, (
+    assert saved.last_prompt_tokens == 1200, "the numerator tracks the latest turn"
+    assert saved.last_prompt_tokens != saved.input_tokens, (
         "must never silently become the 2200 lifetime sum just because two "
-        "tool-free-looking turns went by"
+        "turns went by - that is regression #1436 itself"
     )
 
 
@@ -1852,9 +1870,14 @@ def test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untou
 ):
     """End-to-end through _run_gateway_chat_streaming: an explicit
     last_prompt_tokens=0 (post-compaction) must overwrite a stale nonzero
-    numerator; an older gateway that omits the field entirely must leave the
-    previous numerator standing rather than have this side guess at one from
-    an empty tool-call list (defect #3 - unreliable tool-free inference).
+    numerator, and must never be mistaken for an absent field.
+
+    That half is the point of the test and is unchanged. The absent-field half
+    changed with the fallback - see the CONTRACT CHANGE note on
+    test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    An absent field now yields this turn's prompt slice instead of leaving a
+    stale numerator standing, because on a Hermes agent the field is ALWAYS
+    absent and "leave it standing" leaves it standing at nothing.
     """
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -1878,20 +1901,18 @@ def test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untou
     saved = models.get_session(s.session_id)
     assert saved.last_prompt_tokens == 0, "an explicit 0 must be trusted, not treated as absent"
 
-    # Bump it back up, then simulate an older gateway that omits the field on
-    # a tool-free turn. Old behaviour would have inferred a fresh numerator
-    # from input_tokens using the empty-tool-call-list heuristic (defect #3);
-    # the fix leaves last_prompt_tokens exactly where it was instead.
+    # Bump it back up, then take a turn with the field absent - which on a
+    # Hermes agent is every turn. A stale 26257 kept beside a 9000-token
+    # prompt is not "no claim", it is a wrong claim that never self-corrects.
     saved.last_prompt_tokens = 26257
     saved.save()
     _run_gateway_turn(
         tmp_path, monkeypatch, saved, '{"prompt_tokens":9000,"completion_tokens":10}',
     )
     saved = models.get_session(s.session_id)
-    assert saved.last_prompt_tokens == 26257, (
-        "no last_prompt_tokens on the wire means no authoritative per-turn "
-        "signal - the old numerator must stand, not a guess derived from "
-        "input_tokens and an empty tool-call list"
+    assert saved.last_prompt_tokens == 9000, (
+        "with no wire signal the current turn's prompt slice replaces a stale "
+        "numerator; the removed tool-free gate is not what supplies it"
     )
 
 
@@ -1944,3 +1965,235 @@ def test_gateway_explicit_zero_threshold_survives_the_75_percent_default_and_don
     )
     saved = models.get_session(s.session_id)
     assert saved.threshold_tokens == 0, "an omitted field on a later turn must not revive the default"
+
+
+def test_gateway_that_never_sends_last_prompt_tokens_still_gets_a_ring_numerator(
+    tmp_path, monkeypatch
+):
+    """A Hermes agent sends no last_prompt_tokens, so the ring needs a fallback.
+
+    The runs API's whole terminal usage contract is
+    gateway/platforms/api_server_runs.py::_USAGE_FIELDS - input/output/total
+    tokens, plus the two cache counters since agent 0.21.3 - and the
+    chat/completions path reports the same session counters. Neither mentions
+    last_prompt_tokens (checked against 0.21.0 and 0.21.3), so trusting the
+    wire alone leaves the numerator unset forever. static/ui.js then takes its
+    `hasPromptTok` false branch and renders lifetime in+out instead: a number
+    that climbs every turn and is not a share of the window at all, which is
+    the #1436 regression the field exists to prevent.
+
+    The substitute is this turn's own prompt slice. It must be the SLICE: the
+    loop above rewrites usage["input_tokens"] into the session's lifetime
+    total, and using that would reproduce the very climb being fixed.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    s.context_length = 200_000  # resolved, so the ring has a denominator too
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":120000,"completion_tokens":800,"total_tokens":120800}',
+        out=out,
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 120_000, (
+        "with no last_prompt_tokens on the wire the ring must still get this turn's "
+        "prompt size, or it silently falls back to a meaningless lifetime total"
+    )
+    assert out["done_usage"]["last_prompt_tokens"] == 120_000, (
+        "the done event is what the ring reads on a session's first turn, before the "
+        "browser has a cached session to backfill from"
+    )
+
+    # The wire-value-wins and explicit-zero halves of the contract are pinned by
+    # test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untouched;
+    # the cumulative-drift invariant by
+    # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    # What is unique here is the done event: the ring reads it, not the session,
+    # on a session's first turn.
+
+
+# ── The 75% context ceiling ──────────────────────────────────────────────────
+
+
+def _ceiling_env(monkeypatch, status="running"):
+    """Make the ceiling's two external dependencies available and observable.
+
+    Returns the list of compression-start bodies the trigger actually sent.
+    The agent bundle is stubbed because `import agent.context_compressor`
+    is the trigger's own guard and is absent from checkouts without it - the
+    parent package has to be bound too, or the import statement still fails.
+    """
+    import sys
+    from unittest.mock import MagicMock
+
+    import api.routes as routes
+
+    calls = []
+
+    def fake_start(handler, body):
+        calls.append(dict(body))
+        handler.wfile.write(
+            json.dumps({"status": status, "session_id": body["session_id"]}).encode()
+        )
+
+    monkeypatch.setitem(sys.modules, "agent", MagicMock())
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", MagicMock())
+    monkeypatch.setattr(routes, "_handle_session_compress_start", fake_start)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    return calls
+
+
+def test_ceiling_fires_at_the_step_where_the_ring_turns_red(monkeypatch):
+    """75% is where the ring goes red and offers the manual button, so that is
+    also where the automatic ceiling acts - one number, not two."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 75_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert calls == [{"session_id": "sid"}]
+
+
+def test_below_the_ceiling_nothing_is_compressed(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 74_999}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_a_repeat_at_the_same_size_does_not_summarize_again(monkeypatch):
+    """Compression may legitimately report "unchanged". Without this guard a
+    context that cannot shrink is re-summarized after every single turn."""
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert len(calls) == 1, "the same prompt size must not trigger twice"
+
+    # It grew despite the attempt - that is a new situation, so try again.
+    usage = {"context_length": 100_000, "last_prompt_tokens": 95_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is True
+    assert len(calls) == 2
+
+
+def test_the_ceiling_is_configurable_and_zero_turns_it_off(monkeypatch):
+    calls = _ceiling_env(monkeypatch)
+    usage = {"context_length": 100_000, "last_prompt_tokens": 60_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    cfg = {"webui_auto_compress_pct": 50}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, cfg) is True
+
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000},
+        {"webui_auto_compress_pct": 0},
+    ) is False
+    assert len(calls) == 1
+
+
+def test_an_unknown_window_or_numerator_never_triggers(monkeypatch):
+    """Without both numbers there is no ratio, and a guess would compress a
+    context that may be nowhere near full."""
+    calls = _ceiling_env(monkeypatch)
+    for usage in (
+        {"last_prompt_tokens": 900_000},                       # no window
+        {"context_length": 100_000},                           # no numerator
+        {"context_length": 100_000, "last_prompt_tokens": float("inf")},
+        {"context_length": float("nan"), "last_prompt_tokens": 90_000},
+        {"context_length": 100_000, "last_prompt_tokens": "lots"},
+    ):
+        gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+        assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert calls == []
+
+
+def test_no_local_compressor_means_no_compression_attempt(monkeypatch):
+    """A WebUI deployed without the agent bundle can still talk to a gateway.
+    Failing a job on every turn above the ceiling would be worse than leaving
+    the context alone."""
+    import sys
+
+    import api.routes as routes
+
+    started = []
+    monkeypatch.setattr(
+        routes, "_handle_session_compress_start",
+        lambda handler, body: started.append(body),
+    )
+    monkeypatch.setitem(sys.modules, "agent.context_compressor", None)
+    monkeypatch.setitem(sys.modules, "agent", None)
+    gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.clear()
+
+    assert gateway_chat.maybe_autocompress_gateway_session(
+        "sid", {"context_length": 100_000, "last_prompt_tokens": 99_000}, {},
+    ) is False
+    assert started == []
+
+
+def test_a_refused_job_is_not_recorded_as_an_attempt(monkeypatch):
+    """The endpoint refuses while a session is still streaming (409). That is
+    not "already handled at this size" - the next turn must be free to retry."""
+    calls = _ceiling_env(monkeypatch, status="error")
+    usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
+    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    assert gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER == {}
+    assert len(calls) == 1
+
+
+def test_tooltip_threshold_states_the_figure_the_ceiling_enforces(monkeypatch):
+    """The "Auto-compress at X" line must not be a lookalike constant that can
+    drift away from the number actually acted on."""
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 100_000) == 75_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 60}, 100_000) == 60_000
+    assert gateway_chat.gateway_auto_compress_threshold_tokens(
+        {"webui_auto_compress_pct": 0}, 100_000) == 0
+    assert gateway_chat.gateway_auto_compress_threshold_tokens({}, 0) == 0
+    # Junk in config must not disable the ceiling silently.
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": "nonsense"}) == 75
+    assert gateway_chat.gateway_auto_compress_pct({"webui_auto_compress_pct": 400}) == 100
+
+
+def test_a_turn_above_the_ceiling_announces_compression_on_the_stream(
+    tmp_path, monkeypatch
+):
+    """End-to-end: the frontend resumes the job off a compress_started event,
+    so the event must actually reach the stream - and only after the job is
+    registered, or the browser polls a job that does not exist yet.
+
+    This also pins that the ceiling sees a numerator at all: the fallback in
+    _run_gateway_chat_streaming is what supplies it, since no Hermes agent
+    sends last_prompt_tokens.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+    calls = _ceiling_env(monkeypatch)
+
+    s = new_session()
+    s.context_length = 100_000
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":90000,"completion_tokens":100}',
+        out=out,
+    )
+    assert calls == [{"session_id": s.session_id}], (
+        "a turn ending at 90% of a 100k window must admit a compression job"
+    )
+    assert out["events"].index("compress_started") > out["events"].index("done"), (
+        "announced after done, so the job is registered before the browser resumes it"
+    )
+    assert out["events"].index("compress_started") < out["events"].index("stream_end")

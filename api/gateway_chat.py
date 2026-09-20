@@ -553,6 +553,123 @@ def _gateway_stream_usage(payload: dict) -> dict:
     return out
 
 
+# ── The context ceiling ──────────────────────────────────────────────────────
+#
+# An in-process turn hands compaction to the agent's own ContextCompressor. A
+# gateway turn builds no agent, and the Hermes agent behind the gateway does
+# not compact on the WebUI's behalf either: sessions here have been observed
+# at 108% and 154% of the model's window with nothing acting on them. So a
+# gateway session had no ceiling at all - the ring could sit deep in the red
+# and the turn would just keep growing until the provider refused it.
+#
+# 75 is the step where the ring turns red and offers the manual button, so the
+# automatic ceiling and the visible warning are the same number.
+_GATEWAY_AUTO_COMPRESS_PCT_DEFAULT = 75
+
+# session_id -> the prompt size that last triggered an attempt. Compression is
+# allowed to report "unchanged"; without this a context that cannot shrink
+# would be summarized again after every single turn.
+_GATEWAY_AUTO_COMPRESS_LAST_TRIGGER: dict[str, int] = {}
+
+
+def _gateway_count(value) -> int:
+    """Coerce a reported token count to a usable int, or 0.
+
+    Same trust boundary as _first_int() inside _gateway_stream_usage, hoisted
+    to module scope for the ceiling's own reads. OverflowError matters here:
+    int(float("inf")) raises it, and an uncaught one would abort the turn
+    after it had already completed.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number) or number < 0:
+        return 0
+    try:
+        return int(number)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def gateway_auto_compress_pct(cfg) -> int:
+    """Percent of the window that triggers auto-compression; 0 disables it.
+
+    Overridable with ``webui_auto_compress_pct`` in config.yaml.
+    """
+    raw = cfg.get("webui_auto_compress_pct") if isinstance(cfg, dict) else None
+    if raw is None:
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    try:
+        pct = int(float(raw))
+    except (TypeError, ValueError, OverflowError):
+        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
+    return max(0, min(100, pct))
+
+
+def gateway_auto_compress_threshold_tokens(cfg, context_length) -> int:
+    """The token count the ceiling lands on for this window, or 0."""
+    window = _gateway_count(context_length)
+    pct = gateway_auto_compress_pct(cfg)
+    if not window or not pct:
+        return 0
+    return int(round(window * pct / 100))
+
+
+def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -> bool:
+    """Start a compression job when the finished turn sat above the ceiling.
+
+    Runs the same job the composer's "compress now" button starts, so the
+    guards, the status endpoint, the transcript marker and the running card
+    are all the existing ones. Returns whether a job was admitted.
+
+    Reads the numerator from ``usage`` rather than the session because that is
+    the value the ring itself is drawn from - if the ceiling fired on anything
+    else, the ring and the ceiling could disagree about the same turn.
+    """
+    pct = gateway_auto_compress_pct(cfg)
+    if not pct or not session_id:
+        return False
+    window = _gateway_count((usage or {}).get("context_length"))
+    prompt_tokens = _gateway_count((usage or {}).get("last_prompt_tokens"))
+    if not window or not prompt_tokens:
+        return False
+    if prompt_tokens * 100 < window * pct:
+        return False
+    if prompt_tokens <= _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.get(session_id, 0):
+        # Already attempted at this size and the context did not come down.
+        # Wait until it actually grows again.
+        return False
+    try:
+        # Compression runs in this process against the local agent bundle. A
+        # WebUI deployed without it can still talk to a gateway, and there the
+        # honest answer is to leave the context alone rather than fail a job
+        # on every turn above the ceiling.
+        import agent.context_compressor  # noqa: F401
+    except Exception:
+        logger.debug("Gateway auto-compression unavailable: no local compressor")
+        return False
+    try:
+        from api.routes import _handle_session_compress_start, _ManualCompressionMemoryHandler
+
+        handler = _ManualCompressionMemoryHandler()
+        _handle_session_compress_start(handler, {"session_id": session_id})
+        payload = handler.payload()
+    except Exception:
+        logger.debug("Gateway auto-compression could not start for %s", session_id, exc_info=True)
+        return False
+    started = isinstance(payload, dict) and payload.get("status") == "running"
+    if started:
+        _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER[session_id] = prompt_tokens
+        logger.info(
+            "Gateway auto-compression started for session %s (%s of %s tokens, ceiling %s%%)",
+            session_id, prompt_tokens, window, pct,
+        )
+    return started
+
+
 def _gateway_reasoning_delta(payload: dict) -> str:
     if not isinstance(payload, dict):
         return ""
@@ -1462,10 +1579,13 @@ def _run_gateway_chat_streaming(
             # terminal SSE chunk already carries it; the agent is fresh per
             # request, so this is the turn's total and accumulates.
             # Read the per-turn prompt size BEFORE the loop below rewrites
-            # usage["input_tokens"] into the lifetime total. The tool-free
-            # fallback further down needs this turn's slice; handing it the
-            # cumulative sum makes the context ring climb every turn, which is
-            # the exact regression #1436 introduced last_prompt_tokens to stop.
+            # usage["input_tokens"] into the lifetime total. The fallback
+            # further down needs this turn's slice; handing it the cumulative
+            # sum makes the context ring climb every turn, which is the exact
+            # regression #1436 introduced last_prompt_tokens to stop.
+            _turn_prompt_tokens = usage.get("input_tokens") or 0
+            if isinstance(_turn_prompt_tokens, bool) or not isinstance(_turn_prompt_tokens, (int, float)):
+                _turn_prompt_tokens = 0
             for _uk in (
                 "input_tokens",
                 "output_tokens",
@@ -1489,12 +1609,11 @@ def _run_gateway_chat_streaming(
             # Context-ring fields (ui.js #1436). Numerator: the gateway sums
             # usage across the turn's API calls, so it equals the real prompt
             # size ONLY on a tool-free turn; on a 3-call tool turn it triples
-            # and would light the red "compress now" nag. Hence the gate below.
-            # ponytail: tool turns keep the previous (stale) numerator, and a
-            # tool-using first turn gets none at all - under-reporting, which is
-            # always safe here (never a false nag). Reading the compressor's own
-            # last_prompt_tokens from the gateway process is the real fix and
-            # supersedes this heuristic.
+            # and would light the red "compress now" nag. Reading the
+            # compressor's own last_prompt_tokens from the gateway process is
+            # the real fix and supersedes the estimate - but no Hermes agent
+            # sends it (see below), so the estimate has to stand in rather
+            # than leave the ring with nothing to divide.
             try:
                 # The gateway reports the compressor's own last_prompt_tokens -
                 # the single most recent real prompt, correct on tool turns too
@@ -1502,21 +1621,41 @@ def _run_gateway_chat_streaming(
                 # an explicit 0 (the compressor's post-compaction clamp) - do not
                 # fall back to a heuristic when the wire value is there.
                 #
-                # An older gateway that omits the key entirely leaves this
-                # branch untaken and the previous numerator stands. There used
-                # to be a tool-free fallback here keyed on "no tool-progress
-                # events observed for this stream_id" - but an empty
-                # STREAM_LIVE_TOOL_CALLS entry only proves no progress events
-                # were *received*; a gateway/proxy that doesn't emit them can
-                # still have run multiple tool calls, and this side has no
-                # authoritative per-turn call count to tell the difference. A
-                # confidently wrong numerator is worse than a stale one, so an
-                # absent key now leaves last_prompt_tokens/threshold_tokens
-                # untouched rather than guess.
+                # A gateway that omits the key leaves this branch untaken, and
+                # the fallback below supplies the numerator instead. That is
+                # not a rare legacy case: a Hermes agent never sends the field
+                # on EITHER of its API paths. The whole wire contract of the
+                # runs API is gateway/platforms/api_server_runs.py::
+                # _USAGE_FIELDS - input/output/total tokens, plus the two cache
+                # counters since agent 0.21.3 - and chat/completions reports
+                # the same session counters. Checked against 0.21.0 and 0.21.3;
+                # neither mentions last_prompt_tokens anywhere.
+                #
+                # The fallback that used to live here was keyed on "no
+                # tool-progress events observed for this stream_id", and that
+                # gate was rightly removed: an empty STREAM_LIVE_TOOL_CALLS
+                # entry only proves no progress events were *received*. The
+                # gate is not restored - only the fallback, unconditionally.
                 if "last_prompt_tokens" in usage:
                     _gw_wire = usage.get("last_prompt_tokens") or 0
                     if isinstance(_gw_wire, (int, float)):
                         s.last_prompt_tokens = int(_gw_wire)
+                elif _turn_prompt_tokens > 0:
+                    # This turn's prompt slice, read before the loop above made
+                    # usage["input_tokens"] cumulative.
+                    #
+                    # The gateway sums usage across the turn's API calls, so on
+                    # a tool turn this overstates the real prompt and can nag
+                    # early. That cost is real, but the alternative is not a
+                    # better number - it is NO number: with the numerator unset
+                    # ui.js drops to lifetime in+out, which climbs every turn
+                    # and is not a share of the window at all. An occasional
+                    # early nag that self-corrects on the next tool-free turn
+                    # beats a permanently meaningless ring.
+                    s.last_prompt_tokens = int(_turn_prompt_tokens)
+                    # On a session's first turn the ring reads the done event,
+                    # not the session - see the backfill block further down.
+                    usage["last_prompt_tokens"] = int(_turn_prompt_tokens)
                 if "threshold_tokens" in usage:
                     _gw_thresh = usage.get("threshold_tokens") or 0
                     if isinstance(_gw_thresh, (int, float)):
@@ -1560,9 +1699,16 @@ def _run_gateway_chat_streaming(
                 # clobbered it with this fabricated default. api/models.py's
                 # Session defaults threshold_tokens to None, so check identity
                 # against that instead of truthiness against 0.
+                #
+                # The number comes from the same knob the ceiling enforces, so
+                # the tooltip's "Auto-compress at X" states the figure this
+                # path actually acts on rather than a lookalike constant that
+                # could drift away from it.
                 _gw_cl_now = getattr(s, "context_length", 0) or 0
                 if _gw_cl_now > 0 and getattr(s, "threshold_tokens", None) is None:
-                    s.threshold_tokens = int(_gw_cl_now * 0.75)
+                    _gw_ceiling = gateway_auto_compress_threshold_tokens(cfg, _gw_cl_now)
+                    if _gw_ceiling:
+                        s.threshold_tokens = _gw_ceiling
             except Exception:
                 pass
 
@@ -1662,6 +1808,13 @@ def _run_gateway_chat_streaming(
         except Exception:
             pass
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
+        # After "done", so the ceiling reads the same usage the ring was just
+        # drawn from, and after s.active_stream_id was cleared above - the
+        # compression endpoint refuses a session that is still streaming.
+        # Announced only once the job is registered, so the frontend resumes a
+        # job that exists rather than racing it.
+        if maybe_autocompress_gateway_session(session_id, usage, cfg):
+            put_gateway_event("compress_started", {"session_id": session_id, "automatic": True})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
         try:
