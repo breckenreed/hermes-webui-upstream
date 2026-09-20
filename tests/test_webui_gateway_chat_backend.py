@@ -2138,14 +2138,43 @@ def test_no_local_compressor_means_no_compression_attempt(monkeypatch):
     assert started == []
 
 
-def test_a_refused_job_is_not_recorded_as_an_attempt(monkeypatch):
+def test_a_refused_job_is_not_recorded_as_an_attempt(monkeypatch, caplog):
     """The endpoint refuses while a session is still streaming (409). That is
-    not "already handled at this size" - the next turn must be free to retry."""
+    not "already handled at this size" - the next turn must be free to retry,
+    and the refusal has to be legible or the ceiling looks like it never ran."""
+    import logging
+
     calls = _ceiling_env(monkeypatch, status="error")
     usage = {"context_length": 100_000, "last_prompt_tokens": 90_000}
-    assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
+    with caplog.at_level(logging.WARNING, logger="api.gateway_chat"):
+        assert gateway_chat.maybe_autocompress_gateway_session("sid", usage, {}) is False
     assert gateway_chat._GATEWAY_AUTO_COMPRESS_LAST_TRIGGER == {}
     assert len(calls) == 1
+    assert "refused" in caplog.text, "the endpoint's refusal must reach the log"
+
+
+def test_a_ceiling_that_does_nothing_says_so_out_loud(monkeypatch, caplog):
+    """A silent ceiling and a broken one look identical from outside.
+
+    Nothing in this application configures logging - no basicConfig, no
+    handlers - so Python's last-resort handler emits WARNING and above and
+    silently drops INFO and DEBUG. Reporting the ceiling's work at INFO
+    reported it into a void, which is how "it never fired" and "we cannot see
+    it fire" stayed indistinguishable across two deploys. The ordinary
+    outcomes are logged at WARNING deliberately; this test pins that, so a
+    later tidy-up to INFO has to argue with it rather than quietly re-blind
+    the thing.
+    """
+    import logging
+
+    _ceiling_env(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="api.gateway_chat"):
+        # The exact shape of the live failure: a numerator that never arrived.
+        assert gateway_chat.maybe_autocompress_gateway_session(
+            "sid", {"context_length": 100_000}, {}) is False
+    assert "inert" in caplog.text, "an inert ceiling must be visible at WARNING"
+    assert "last_prompt" in caplog.text, "and must name the value that was missing"
+    assert "context_length" in caplog.text, "and the keys it did have, to place the blame"
 
 
 def test_tooltip_threshold_states_the_figure_the_ceiling_enforces(monkeypatch):

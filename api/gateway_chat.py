@@ -571,6 +571,19 @@ _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT = 75
 # would be summarized again after every single turn.
 _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER: dict[str, int] = {}
 
+# Every outcome below is logged at WARNING, including the ordinary ones.
+#
+# That is not severity inflation, it is the only visible level: nothing in
+# this application configures logging - no basicConfig, no handlers - so
+# Python's last-resort handler applies and emits WARNING and above to stderr,
+# and nothing else. A ceiling that reports its work at INFO reports it into a
+# void, which is how "it never fired" and "we cannot see it fire" stayed
+# indistinguishable through two deploys and one wrong conclusion.
+#
+# One line per gateway turn is the price. If this ever moves upstream behind
+# real logging config, the ordinary outcomes belong at INFO or DEBUG.
+_CEILING_LOG = "Gateway context ceiling — %s"
+
 
 def _gateway_count(value) -> int:
     """Coerce a reported token count to a usable int, or 0.
@@ -635,12 +648,32 @@ def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -
     window = _gateway_count((usage or {}).get("context_length"))
     prompt_tokens = _gateway_count((usage or {}).get("last_prompt_tokens"))
     if not window or not prompt_tokens:
+        # Loud on purpose. Without both numbers the ceiling does nothing, and
+        # from outside that is indistinguishable from "the context was fine" -
+        # which is exactly the hole this function fell into once already. The
+        # raw values and the available keys are what say WHY.
+        logger.warning(
+            _CEILING_LOG % "inert: window=%r last_prompt=%r for %s (usage keys: %s)",
+            (usage or {}).get("context_length"),
+            (usage or {}).get("last_prompt_tokens"),
+            session_id,
+            ",".join(sorted((usage or {}).keys())) or "none",
+        )
         return False
+    ratio = prompt_tokens * 100 / window
     if prompt_tokens * 100 < window * pct:
+        logger.warning(
+            _CEILING_LOG % "below ceiling: %s/%s tokens (%.1f%% < %s%%) for %s",
+            prompt_tokens, window, ratio, pct, session_id,
+        )
         return False
     if prompt_tokens <= _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.get(session_id, 0):
         # Already attempted at this size and the context did not come down.
         # Wait until it actually grows again.
+        logger.warning(
+            _CEILING_LOG % "already attempted at %s tokens for %s; waiting for growth",
+            prompt_tokens, session_id,
+        )
         return False
     try:
         # Compression runs in this process against the local agent bundle. A
@@ -649,7 +682,10 @@ def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -
         # on every turn above the ceiling.
         import agent.context_compressor  # noqa: F401
     except Exception:
-        logger.debug("Gateway auto-compression unavailable: no local compressor")
+        logger.warning(
+            _CEILING_LOG % "no local compressor, leaving context alone (session %s)",
+            session_id,
+        )
         return False
     try:
         from api.routes import _handle_session_compress_start, _ManualCompressionMemoryHandler
@@ -658,14 +694,22 @@ def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -
         _handle_session_compress_start(handler, {"session_id": session_id})
         payload = handler.payload()
     except Exception:
-        logger.debug("Gateway auto-compression could not start for %s", session_id, exc_info=True)
+        logger.warning(
+            _CEILING_LOG % "compression start raised for %s", session_id, exc_info=True,
+        )
         return False
     started = isinstance(payload, dict) and payload.get("status") == "running"
     if started:
         _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER[session_id] = prompt_tokens
-        logger.info(
-            "Gateway auto-compression started for session %s (%s of %s tokens, ceiling %s%%)",
-            session_id, prompt_tokens, window, pct,
+        logger.warning(
+            _CEILING_LOG % "STARTED for session %s (%s of %s tokens, %.1f%% >= %s%%)",
+            session_id, prompt_tokens, window, ratio, pct,
+        )
+    else:
+        # The endpoint refused. Its own payload carries the reason - a 409 for
+        # a session still streaming, a 404, a stale-runtime barrier.
+        logger.warning(
+            _CEILING_LOG % "start refused for %s -> %r", session_id, payload,
         )
     return started
 
