@@ -11,6 +11,8 @@
 > Automated coverage: ~11,500 tests collected via `./scripts/test.sh tests/ --collect-only -q`. Tests run on every PR via GitHub Actions on Python 3.11, 3.12, and 3.13 (3 parallel shards each), alongside a ruff lint gate, a headless browser smoke test, and a Docker smoke test. The suite covers the bootstrap/static wizard, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, CSS regression coverage for thinking/tool card animation, streaming session persistence, mobile layout breakpoints, locale parity across 14 languages, and hundreds of issue/PR-pinned regression tests.
 > Run: `./scripts/test.sh`
 >
+> No host Python toolchain? `./scripts/docker-build.sh --test` (Windows: `.\scripts\docker-build.ps1 -Test`) copies the repo into a throwaway container built from this checkout, installs `requirements-dev.txt` there, and runs pytest against the image's baked venv. Nothing is written to the working tree. The full suite takes a long time in one container; run a slice with `pytest-shard` the way CI does, passing pytest arguments through `PYTEST_ARGS` (e.g. `PYTEST_ARGS="--shard-id=0 --num-shards=8" ./scripts/docker-build.sh --test`). See [Hermetic, container-only build](docs/docker.md#hermetic-container-only-build).
+>
 > Local regression focus: verify that a previously closed workspace panel stays visually closed from first paint through boot completion on desktop refresh; there should be no brief open-then-close flash.
 
 ---
