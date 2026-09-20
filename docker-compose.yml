@@ -33,6 +33,17 @@ services:
         #   HERMES_AGENT_IMAGE=nousresearch/hermes-agent@sha256:<digest>
         # `./scripts/docker-build.sh --pin` (PowerShell: -Pin) resolves the
         # current tag to a digest for you.
+        #
+        # IF YOU PATCH THE AGENT, SET THIS. The WebUI does not talk to a separate
+        # agent container: it bakes its own copy of the agent here (see
+        # `COPY --from=agent-picked` in the Dockerfile) and runs the gateway out
+        # of /opt/hermes-agent — `~/.hermes/gateway_state.json` names the process.
+        # So a patched agent image sitting next to this one is not in the turn
+        # path, and leaving this at upstream's tag serves every turn from an
+        # unpatched agent while the patch looks applied.
+        #
+        #   HERMES_AGENT_IMAGE=my-patched-agent:latest docker compose build
+        #   ./scripts/docker-build.sh --agent-image my-patched-agent:latest
         HERMES_AGENT_IMAGE: ${HERMES_AGENT_IMAGE:-nousresearch/hermes-agent:latest}
         # image = bake the agent in; none = supply it at runtime by a mount.
         AGENT_SOURCE: ${AGENT_SOURCE:-image}
