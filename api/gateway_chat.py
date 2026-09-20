@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -29,6 +30,7 @@ from api.config import (
     coerce_reasoning_effort_for_model,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
+    peek_stream,
     register_active_run,
     unregister_active_run,
     unregister_stream_owner,
@@ -464,246 +466,91 @@ def _gateway_sse_reasoning_delta(payload: dict) -> str:
         return ""
 
 
-def _gateway_usage_int(value) -> int:
-    """Coerce a gateway-reported token count to int without killing the stream.
-
-    Gateways and the providers behind them disagree about whether counts arrive
-    as ints, floats or numeric strings. A ValueError here would abort a turn
-    that otherwise completed, so anything unparseable counts as zero.
-    """
-    try:
-        return max(0, int(float(value or 0)))
-    except (TypeError, ValueError):
-        return 0
+# last_prompt_tokens/threshold_tokens: presence, not truthiness, decides
+# whether a frame's value replaces the running one - see the comment in
+# _gateway_stream_usage(). Shared so every merge site agrees with the parser.
+_CONTEXT_RING_PRESENCE_KEYS = frozenset({"last_prompt_tokens", "threshold_tokens"})
 
 
 def _gateway_stream_usage(payload: dict) -> dict:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
         return {}
-    prompt_tokens = _gateway_usage_int(usage.get("prompt_tokens") or usage.get("input_tokens"))
-    out = {
-        "input_tokens": prompt_tokens,
-        "output_tokens": _gateway_usage_int(usage.get("completion_tokens") or usage.get("output_tokens")),
-        "estimated_cost": usage.get("estimated_cost") or usage.get("estimated_cost_usd") or 0,
-        # The context indicator divides the size of the request that was
-        # actually sent by the model's window. `prompt_tokens` IS that
-        # numerator for an OpenAI-shaped response: it counts the whole context
-        # submitted for this turn, not a delta. Without it the WebUI has no
-        # numerator at all and every gateway-backed turn renders "no data".
-        "last_prompt_tokens": prompt_tokens,
-    }
-    details = usage.get("prompt_tokens_details")
-    cache_read = _gateway_usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-    if not cache_read:
-        cache_read = _gateway_usage_int(
-            usage.get("cache_read_input_tokens") or usage.get("cache_read_tokens")
-        )
-    cache_write = _gateway_usage_int(
-        usage.get("cache_creation_input_tokens") or usage.get("cache_write_tokens")
-    )
-    if cache_read:
-        out["cache_read_tokens"] = cache_read
-    if cache_write:
-        out["cache_write_tokens"] = cache_write
-    return out
 
-
-def _gateway_context_length(cfg, model: str, model_provider: str) -> int:
-    """Resolve the model's context window for a gateway turn.
-
-    The gateway reports how many tokens a turn spent but never the size of the
-    window they are measured against, so without this the WebUI divides by its
-    own 128K JavaScript default and shows a percentage for the wrong model.
-    The in-process path resolves the same number from model metadata; the base
-    URL is deliberately left to config, because the gateway's own URL is not
-    the model provider's.
-    """
-    if not str(model or "").strip():
-        return 0
-    try:
-        from agent.model_metadata import get_model_context_length
-        from api.routes import _context_length_lookup_inputs_for_model
-
-        lookup = _context_length_lookup_inputs_for_model(
-            model,
-            model_provider,
-            cfg=cfg if isinstance(cfg, dict) else {},
-        )
-        try:
-            resolved = get_model_context_length(
-                model,
-                lookup.base_url,
-                api_key=lookup.api_key,
-                config_context_length=lookup.config_context_length,
-                provider=lookup.provider or model_provider or "",
-                custom_providers=lookup.custom_providers,
-            )
-        except TypeError:
-            # Older hermes-agent builds only accept the legacy 2-arg form.
-            resolved = get_model_context_length(model, lookup.base_url)
-        return _gateway_usage_int(resolved)
-    except Exception:
-        logger.debug("Gateway context-length resolution failed for %s", model, exc_info=True)
-        return 0
-
-
-# Share of the context window at which a finished gateway turn compresses
-# itself. The in-process path leaves this to the agent's own compressor, which
-# a gateway deployment does not expose, so a gateway session had no ceiling at
-# all: the indicator could read 169% and nothing acted on it. 75 is the step
-# where the ring turns red and offers the manual button, so the automatic
-# ceiling and the visible warning are the same number.
-_GATEWAY_AUTO_COMPRESS_PCT_DEFAULT = 75
-
-# session_id -> the request size that last triggered an attempt. Compression is
-# allowed to report "unchanged"; without this guard a context that cannot
-# shrink would be summarized again after every single turn.
-_GATEWAY_AUTO_COMPRESS_LAST_TRIGGER: dict[str, int] = {}
-
-
-def gateway_auto_compress_pct(cfg) -> int:
-    """Percent of the window that triggers auto-compression, 0 to disable.
-
-    Overridable with ``webui_auto_compress_pct`` in config.yaml.
-    """
-    raw = cfg.get("webui_auto_compress_pct") if isinstance(cfg, dict) else None
-    if raw is None:
-        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
-    try:
-        pct = int(float(raw))
-    except (TypeError, ValueError):
-        return _GATEWAY_AUTO_COMPRESS_PCT_DEFAULT
-    return max(0, min(100, pct))
-
-
-def gateway_auto_compress_threshold_tokens(cfg, context_length) -> int:
-    """The token count the auto-compress ceiling lands on for this window."""
-    window = _gateway_usage_int(context_length)
-    pct = gateway_auto_compress_pct(cfg)
-    if not window or not pct:
-        return 0
-    return int(round(window * pct / 100))
-
-
-def maybe_autocompress_gateway_session(session_id: str, usage: dict, cfg=None) -> bool:
-    """Start a compression job when the finished turn sat above the ceiling.
-
-    Runs the same job the composer's "compress now" button starts, so the
-    guards, the status endpoint and the transcript marker are all the existing
-    ones. Returns whether a job was admitted.
-    """
-    pct = gateway_auto_compress_pct(cfg)
-    if not pct or not session_id:
-        return False
-    window = _gateway_usage_int((usage or {}).get("context_length"))
-    prompt_tokens = _gateway_usage_int((usage or {}).get("last_prompt_tokens"))
-    if not window or not prompt_tokens:
-        return False
-    if prompt_tokens * 100 < window * pct:
-        return False
-    if prompt_tokens <= _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER.get(session_id, 0):
-        # Already attempted at this size and the context did not come down.
-        # Wait until it actually grows again.
-        return False
-    try:
-        # Compression runs in this process against the local agent bundle. A
-        # WebUI deployed without it can still talk to a gateway, and there the
-        # honest answer is to leave the context alone rather than fail a job on
-        # every turn above the ceiling.
-        import agent.context_compressor  # noqa: F401
-    except Exception:
-        logger.debug("Gateway auto-compression unavailable: no local compressor")
-        return False
-    try:
-        from api.routes import _ManualCompressionMemoryHandler, _handle_session_compress_start
-
-        handler = _ManualCompressionMemoryHandler()
-        _handle_session_compress_start(handler, {"session_id": session_id})
-        payload = handler.payload()
-    except Exception:
-        logger.debug("Gateway auto-compression could not start for %s", session_id, exc_info=True)
-        return False
-    started = isinstance(payload, dict) and payload.get("status") == "running"
-    if started:
-        _GATEWAY_AUTO_COMPRESS_LAST_TRIGGER[session_id] = prompt_tokens
-        logger.info(
-            "Gateway auto-compression started for session %s (%s of %s tokens, ceiling %s%%)",
-            session_id, prompt_tokens, window, pct,
-        )
-    return started
-
-
-def _apply_gateway_usage_to_session(session, usage: dict, *, cfg=None, model: str = "",
-                                    model_provider: str = "") -> dict:
-    """Fold one gateway turn's usage into the session and complete the payload.
-
-    Gateway responses carry per-request counts; the session stores cumulative
-    ones, and nothing on this path was writing either. A gateway-backed session
-    therefore reloaded with every counter at zero and an empty context meter,
-    however many tokens it had spent.
-
-    Cost is assigned rather than accumulated: whether a gateway reports it per
-    request or per session is not part of the OpenAI-shaped contract, so this
-    keeps the number the gateway sent instead of risking a double count.
-    """
-    if not isinstance(usage, dict):
-        return {}
-    turn_prompt_tokens = _gateway_usage_int(usage.get("last_prompt_tokens") or usage.get("input_tokens"))
-    turn_output_tokens = _gateway_usage_int(usage.get("output_tokens"))
-    turn_cache_read = _gateway_usage_int(usage.get("cache_read_tokens"))
-    turn_cache_write = _gateway_usage_int(usage.get("cache_write_tokens"))
-
-    if session is not None:
-        if turn_prompt_tokens:
-            session.input_tokens = _gateway_usage_int(getattr(session, "input_tokens", 0)) + turn_prompt_tokens
-            session.last_prompt_tokens = turn_prompt_tokens
-        if turn_output_tokens:
-            session.output_tokens = _gateway_usage_int(getattr(session, "output_tokens", 0)) + turn_output_tokens
-        if turn_cache_read:
-            session.cache_read_tokens = _gateway_usage_int(getattr(session, "cache_read_tokens", 0)) + turn_cache_read
-        if turn_cache_write:
-            session.cache_write_tokens = _gateway_usage_int(getattr(session, "cache_write_tokens", 0)) + turn_cache_write
-        cost = usage.get("estimated_cost")
-        if cost:
-            session.estimated_cost = cost
-        resolved_context_length = _gateway_context_length(cfg, model, model_provider)
-        if resolved_context_length:
-            session.context_length = resolved_context_length
-        # The ceiling this path enforces itself, so the tooltip's "auto-compress
-        # at …" line states a number that something actually acts on.
-        auto_threshold = gateway_auto_compress_threshold_tokens(
-            cfg, getattr(session, "context_length", 0)
-        )
-        if auto_threshold:
-            session.threshold_tokens = auto_threshold
-        usage["threshold_tokens"] = _gateway_usage_int(getattr(session, "threshold_tokens", 0))
-        usage["context_length"] = _gateway_usage_int(getattr(session, "context_length", 0))
-        # The indicator reads input/output as session totals (the in-process
-        # path reports the agent's running counters), so hand back the folded
-        # values rather than this turn's slice.
-        usage["input_tokens"] = _gateway_usage_int(getattr(session, "input_tokens", 0))
-        usage["output_tokens"] = _gateway_usage_int(getattr(session, "output_tokens", 0))
-        cumulative_cache_read = _gateway_usage_int(getattr(session, "cache_read_tokens", 0))
-        cumulative_cache_write = _gateway_usage_int(getattr(session, "cache_write_tokens", 0))
-        if cumulative_cache_read or cumulative_cache_write:
-            usage["cache_read_tokens"] = cumulative_cache_read
-            usage["cache_write_tokens"] = cumulative_cache_write
+    def _first_int(*keys) -> int:
+        # Provider JSON relayed verbatim by the gateway. A string, dict or
+        # overflowing token count used to raise here, inside the SSE read loop,
+        # where the outer `except Exception` turns it into "Gateway request
+        # failed" - the whole turn's transcript discarded over one bad usage
+        # field. Skip the junk, keep the turn.
+        for key in keys:
             try:
-                from api.usage import prompt_cache_hit_percent
+                value = int(usage.get(key) or 0)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value:
+                return value
+        return 0
 
-                usage["cache_hit_percent"] = prompt_cache_hit_percent(
-                    cumulative_cache_read,
-                    usage["input_tokens"],
-                )
-            except Exception:
-                logger.debug("Gateway cache-hit percent failed", exc_info=True)
-        usage["post_compression_context_tokens_estimate"] = getattr(
-            session, "post_compression_context_tokens_estimate", None
+    try:
+        _cost = usage.get("estimated_cost")
+        if _cost is None:
+            _cost = usage.get("estimated_cost_usd")
+        # Same relayed-provider-JSON trust boundary as _first_int above, but
+        # costs are legitimately floats so int() can't be the sanitizer here.
+        # A non-finite value (e.g. 1e999 -> +inf) used to survive isinstance()
+        # unchanged, get summed into the session total, and get persisted as
+        # `Infinity` - invalid JSON that then fails to json.loads() on session
+        # restore/list, so the session could no longer load at all. Reject
+        # bool (bool is an int subclass), any non-finite float, and negative
+        # values; keep only a real, usable, non-negative cost.
+        if (
+            isinstance(_cost, bool)
+            or not isinstance(_cost, (int, float))
+            or not math.isfinite(_cost)
+            or _cost < 0
+        ):
+            _cost = 0
+    except Exception:
+        _cost = 0
+    out = {
+        "input_tokens": _first_int("prompt_tokens", "input_tokens"),
+        "output_tokens": _first_int("completion_tokens", "output_tokens"),
+        "estimated_cost": _cost,
+    }
+    # Hermes gateway extras, added only when actually sent: an older gateway
+    # omits them, and a zero here would overwrite a good session value
+    # downstream. Routed through _first_int on purpose - this is the same trust
+    # boundary where a bare int() used to cost the turn its transcript.
+    #
+    # last_prompt_tokens/threshold_tokens are presence-sensitive rather than
+    # truthiness-sensitive: the producing gateway's ContextCompressor clamps
+    # its post-compaction sentinel to a real 0 (see hermes-agent#105905), so
+    # an explicit 0 is a meaningful "just compacted" signal, not "no data".
+    # `_val:` alone can't tell that apart from "key absent" (also 0), so those
+    # two check `usage` directly for key presence.
+    for _extra in (
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "last_prompt_tokens",
+        "threshold_tokens",
+    ):
+        _val = _first_int(_extra)
+        # "Present" means a real, usable number, not merely a key in the
+        # payload: junk (a string, a nested dict, an overflowing/NaN float)
+        # must be dropped exactly like _first_int already drops it for the
+        # billing counters, not treated as an authoritative explicit-zero.
+        _raw = usage.get(_extra)
+        _explicit_zero = (
+            _extra in _CONTEXT_RING_PRESENCE_KEYS
+            and isinstance(_raw, (int, float))
+            and not isinstance(_raw, bool)
+            and math.isfinite(_raw)
+            and _raw >= 0
         )
-    if turn_prompt_tokens:
-        usage["last_prompt_tokens"] = turn_prompt_tokens
-    return usage
+        if _val or _explicit_zero:
+            out[_extra] = _val
+    return out
 
 
 def _gateway_reasoning_delta(payload: dict) -> str:
@@ -814,7 +661,7 @@ def _run_gateway_runs_api_streaming(
             try:
                 from api.streaming import _build_native_multimodal_message
 
-                message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=active_provider, active_model=(model or ""), requested_provider=active_provider)
+                message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=active_provider, active_model=(model or ""), requested_provider=active_provider, profile=getattr(session, "profile", None))
             except Exception:
                 logger.debug("Failed to build runs-API multimodal attachment payload", exc_info=True)
                 message_content = str(msg_text or "")
@@ -977,7 +824,7 @@ def _run_gateway_runs_api_streaming(
                     final_text = output
                     if stream_id in STREAM_PARTIAL_TEXT:
                         STREAM_PARTIAL_TEXT[stream_id] = output
-                usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
+                usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
                 sse_event = "message"
                 continue
             if payload_event == "run.failed":
@@ -1000,7 +847,7 @@ def _run_gateway_runs_api_streaming(
                 if stream_id in STREAM_PARTIAL_TEXT:
                     STREAM_PARTIAL_TEXT[stream_id] += delta
                 put_gateway_event("token", {"text": delta})
-            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
+            usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
     return final_text, usage
 
 
@@ -1150,7 +997,7 @@ def _run_gateway_chat_streaming(
     the configured Gateway API server into those local events and persists the
     final user/assistant turn back into the WebUI session.
     """
-    q = STREAMS.get(stream_id)
+    q = peek_stream(stream_id)
     if q is None:
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
@@ -1350,7 +1197,7 @@ def _run_gateway_chat_streaming(
                 try:
                     from api.streaming import _build_native_multimodal_message
 
-                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""))
+                    message_content = _build_native_multimodal_message("", str(msg_text or ""), attachments, str(workspace), cfg=cfg, active_provider=(model_provider or ""), active_model=(model or ""), requested_provider=(model_provider or ""), profile=getattr(s, "profile", None))
                 except Exception:
                     logger.debug("Failed to build gateway multimodal attachment payload", exc_info=True)
                     message_content = str(msg_text or "")
@@ -1359,6 +1206,23 @@ def _run_gateway_chat_streaming(
                 "stream": True,
                 "messages": [*prefill_messages, {"role": "user", "content": message_content}],
             }
+            # Strip @provider:model prefix (same as runs API path). The grammar
+            # is delegated to the shared parser rather than split by hand: a
+            # bare rsplit(":", 1) eats the model's own tag
+            # (@openrouter:meta/llama-4:free -> "free") and a bare
+            # split(":", 1) eats a custom provider's host:port
+            # (@custom:myhost:8080:model). _split_provider_qualified_model
+            # already knows both shapes and its docstring names this path (#6722).
+            _body_model = body.get("model", "") or ""
+            if _body_model.startswith("@"):
+                try:
+                    from api.routes import _split_provider_qualified_model
+
+                    _bare_model, _provider_hint = _split_provider_qualified_model(_body_model)
+                    if _provider_hint and _bare_model:
+                        body["model"] = _bare_model
+                except Exception:
+                    logger.debug("provider-qualified model strip failed", exc_info=True)
             if model_provider:
                 body["provider"] = model_provider
             if reasoning_effort is not None:
@@ -1471,8 +1335,8 @@ def _run_gateway_chat_streaming(
                         if stream_id in STREAM_PARTIAL_TEXT:
                             STREAM_PARTIAL_TEXT[stream_id] += delta
                         put_gateway_event("token", {"text": delta})
-                    usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v})
-            usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v})
+                    usage.update({k: v for k, v in _gateway_stream_usage(payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
+            usage.update({k: v for k, v in _gateway_stream_usage(last_payload).items() if v or k in _CONTEXT_RING_PRESENCE_KEYS})
         assistant_text = final_text.strip()
         if terminal_error:
             error_payload = _settle_gateway_terminal_error(
@@ -1593,17 +1457,136 @@ def _run_gateway_chat_streaming(
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
-            # Context metering for gateway turns. The in-process path fills
-            # these counters from the agent's compressor before saving; nothing
-            # on this path did, so a gateway-backed session came back from a
-            # reload with an empty context meter no matter what it had spent.
-            usage = _apply_gateway_usage_to_session(
-                s,
-                usage,
-                cfg=cfg,
-                model=model,
-                model_provider=model_provider,
-            )
+            # Gateway turns build no in-process agent/compressor, so nothing else
+            # here ever wrote usage - it persisted 0 for every session. The
+            # terminal SSE chunk already carries it; the agent is fresh per
+            # request, so this is the turn's total and accumulates.
+            # Read the per-turn prompt size BEFORE the loop below rewrites
+            # usage["input_tokens"] into the lifetime total. The fallback
+            # further down needs this turn's slice; handing it the cumulative
+            # sum makes the context ring climb every turn, which is the exact
+            # regression #1436 introduced last_prompt_tokens to stop.
+            _turn_prompt_tokens = usage.get("input_tokens") or 0
+            if isinstance(_turn_prompt_tokens, bool) or not isinstance(_turn_prompt_tokens, (int, float)):
+                _turn_prompt_tokens = 0
+            for _uk in (
+                "input_tokens",
+                "output_tokens",
+                "estimated_cost",
+                # The cache split is parsed by _gateway_stream_usage and read by
+                # static/messages.js (6055/6134), which subtracts the pre-turn
+                # session total exactly as it does for input/output - so these
+                # have to be persisted and reported cumulatively too, or they
+                # read as zero after a reload.
+                "cache_read_tokens",
+                "cache_write_tokens",
+            ):
+                _uv = usage.get(_uk) or 0
+                if isinstance(_uv, (int, float)) and _uv > 0:
+                    setattr(s, _uk, (getattr(s, _uk, 0) or 0) + _uv)
+                # Report the persisted lifetime total, not this turn's slice:
+                # static/messages.js derives the per-turn badge by subtracting
+                # the pre-turn session total, so it needs cumulative numbers.
+                usage[_uk] = getattr(s, _uk, 0) or 0
+
+            # Context-ring fields (ui.js #1436). Numerator: the gateway sums
+            # usage across the turn's API calls, so it equals the real prompt
+            # size ONLY on a tool-free turn; on a 3-call tool turn it triples
+            # and would light the red "compress now" nag. Reading the
+            # compressor's own last_prompt_tokens from the gateway process is
+            # the real fix and supersedes the estimate - but no Hermes agent
+            # sends it (see below), so the estimate has to stand in rather
+            # than leave the ring with nothing to divide.
+            try:
+                # The gateway reports the compressor's own last_prompt_tokens -
+                # the single most recent real prompt, correct on tool turns too
+                # (hermes-agent#105905). Trust it outright on presence, INCLUDING
+                # an explicit 0 (the compressor's post-compaction clamp) - do not
+                # fall back to a heuristic when the wire value is there.
+                #
+                # A gateway that omits the key leaves this branch untaken, and
+                # the fallback below supplies the numerator instead. That is
+                # not a rare legacy case: a Hermes agent never sends the field
+                # on EITHER of its API paths. The whole wire contract of the
+                # runs API is gateway/platforms/api_server_runs.py::
+                # _USAGE_FIELDS - input/output/total tokens, plus the two cache
+                # counters since agent 0.21.3 - and chat/completions reports
+                # the same session counters. Checked against 0.21.0 and 0.21.3;
+                # neither mentions last_prompt_tokens anywhere.
+                #
+                # The fallback that used to live here was keyed on "no
+                # tool-progress events observed for this stream_id", and that
+                # gate was rightly removed: an empty STREAM_LIVE_TOOL_CALLS
+                # entry only proves no progress events were *received*. The
+                # gate is not restored - only the fallback, unconditionally.
+                if "last_prompt_tokens" in usage:
+                    _gw_wire = usage.get("last_prompt_tokens") or 0
+                    if isinstance(_gw_wire, (int, float)):
+                        s.last_prompt_tokens = int(_gw_wire)
+                elif _turn_prompt_tokens > 0:
+                    # This turn's prompt slice, read before the loop above made
+                    # usage["input_tokens"] cumulative.
+                    #
+                    # The gateway sums usage across the turn's API calls, so on
+                    # a tool turn this overstates the real prompt and can nag
+                    # early. That cost is real, but the alternative is not a
+                    # better number - it is NO number: with the numerator unset
+                    # ui.js drops to lifetime in+out, which climbs every turn
+                    # and is not a share of the window at all. An occasional
+                    # early nag that self-corrects on the next tool-free turn
+                    # beats a permanently meaningless ring.
+                    s.last_prompt_tokens = int(_turn_prompt_tokens)
+                    # On a session's first turn the ring reads the done event,
+                    # not the session - see the backfill block further down.
+                    usage["last_prompt_tokens"] = int(_turn_prompt_tokens)
+                if "threshold_tokens" in usage:
+                    _gw_thresh = usage.get("threshold_tokens") or 0
+                    if isinstance(_gw_thresh, (int, float)):
+                        s.threshold_tokens = int(_gw_thresh)
+            except Exception:
+                pass
+
+            # Denominator: without context_length ui.js divides by
+            # DEFAULT_CTX = 128*1024 and mis-sizes the ring for every 1M model.
+            try:
+                if not (getattr(s, "context_length", 0) or 0):
+                    from api.routes import _resolve_context_length_for_session_model as _gw_ctx_resolve
+                    from api.routes import _session_context_length_lookup_state as _gw_ctx_state
+
+                    _gw_model = (model or "").strip()
+                    if _gw_model.startswith("@"):
+                        # '@openrouter:some/model' resolves to the 256K fallback;
+                        # the bare name does not. Same shared strip as the
+                        # request body above, so both resolve the same lane.
+                        from api.routes import _split_provider_qualified_model as _gw_split
+
+                        _gw_bare, _gw_provider_hint = _gw_split(_gw_model)
+                        if _gw_provider_hint and _gw_bare:
+                            _gw_model = _gw_bare
+                    _m, _p, _b, _k = _gw_ctx_state(_gw_model, model_provider or "")
+                    _gw_ctx_len = _gw_ctx_resolve(_m, _p, base_url=_b, api_key=_k) or 0
+                    # 256000 is the resolver's "I do not know this model" default.
+                    # routes.py only re-resolves when context_length is falsy, so
+                    # persisting the fallback would make a wrong window permanent.
+                    if _gw_ctx_len > 0 and _gw_ctx_len != 256_000:
+                        s.context_length = int(_gw_ctx_len)
+                # Compression trigger for the "Auto-compress at X" tooltip
+                # (ui.js hides the line while this is falsy). The gateway owns
+                # the real compressor; 75% of the window is the same default
+                # ContextCompressor derives, so the tooltip stops lying about
+                # nothing rather than claiming a precise number we do not have.
+                #
+                # `getattr(..., 0) or 0` treated an authoritative 0 - just
+                # persisted a few lines up when the wire sent
+                # threshold_tokens: 0 - identically to "never set", and
+                # clobbered it with this fabricated default. api/models.py's
+                # Session defaults threshold_tokens to None, so check identity
+                # against that instead of truthiness against 0.
+                _gw_cl_now = getattr(s, "context_length", 0) or 0
+                if _gw_cl_now > 0 and getattr(s, "threshold_tokens", None) is None:
+                    s.threshold_tokens = int(_gw_cl_now * 0.75)
+            except Exception:
+                pass
 
             def _restore_cancelled_success_writeback():
                 if pending_source == "process_wakeup":
@@ -1682,11 +1665,25 @@ def _run_gateway_chat_streaming(
             )
         from api.streaming import _session_payload_with_full_messages
         gateway_session_payload = _session_payload_with_full_messages(s, tool_calls=[])
+        # The context ring reads its denominator off `usage`, not off the
+        # session (static/ui.js: `usage.context_length || DEFAULT_CTX`). It does
+        # try to backfill from the browser's cached session, but on a session's
+        # FIRST turn that cache predates the value we just persisted, so the ring
+        # silently divides by 128K - a 1M model then reads 20% at 26k and crosses
+        # the compress-hint line at 6.5% of its real window. Send it explicitly.
+        try:
+            for _ck in ("context_length", "threshold_tokens"):
+                _cv = getattr(s, _ck, 0) or 0
+                # `_ck not in usage`, not `not usage.get(_ck)`: threshold_tokens
+                # can be a real, already-correct 0 in `usage` (the wire wrote it
+                # a few lines up in the try block above), and a truthiness check
+                # would treat that the same as "gateway never sent this field"
+                # and stomp it with the session's fabricated 75% default.
+                if isinstance(_cv, (int, float)) and _cv > 0 and _ck not in usage:
+                    usage[_ck] = int(_cv)
+        except Exception:
+            pass
         put_gateway_event("done", {"session": redact_session_data(gateway_session_payload), "usage": usage})
-        # Announce the compression only once the job exists, so the frontend
-        # polls a job that is already registered rather than racing it.
-        if maybe_autocompress_gateway_session(session_id, usage, cfg):
-            put_gateway_event("compress_started", {"session_id": session_id, "automatic": True})
         put_gateway_event("stream_end", {"session_id": session_id})
     except urllib.error.HTTPError as exc:
         try:

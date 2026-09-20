@@ -89,20 +89,15 @@ def test_gateway_sse_delta_extracts_openai_chat_chunks():
 
 
 def test_gateway_stream_usage_normalizes_token_names():
-    # last_prompt_tokens mirrors prompt_tokens: it is the size of the context
-    # actually submitted for this turn, which is what the context indicator
-    # divides by the model's window. See tests/test_gateway_context_metering.py.
     assert _gateway_stream_usage({"usage": {"prompt_tokens": 7, "completion_tokens": 3}}) == {
         "input_tokens": 7,
         "output_tokens": 3,
         "estimated_cost": 0,
-        "last_prompt_tokens": 7,
     }
     assert _gateway_stream_usage({"usage": {"input_tokens": 5, "output_tokens": 2, "estimated_cost_usd": 0.01}}) == {
         "input_tokens": 5,
         "output_tokens": 2,
         "estimated_cost": 0.01,
-        "last_prompt_tokens": 5,
     }
     assert _gateway_stream_usage({}) == {}
 
@@ -350,6 +345,20 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
     assert isinstance(saved.messages[1]["timestamp"], float)
     assert saved.messages[0]["timestamp"] < saved.messages[1]["timestamp"]
     assert saved.active_stream_id is None
+    # Provider-reported usage must reach the session record; it persisted 0 for
+    # every gateway-backed session before this.
+    assert saved.input_tokens == 4
+    assert saved.output_tokens == 2
+    # The fixture is a TOOL turn, and this is the known cost of the fallback:
+    # gateway usage is summed across the turn's API calls, so on a tool turn
+    # the numerator over-reports the real prompt size. It is accepted rather
+    # than gated, because the gate that could tell a tool turn apart was
+    # unreliable and no Hermes agent sends the authoritative value - see the
+    # CONTRACT CHANGE note on
+    # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    # Over-reporting nags early and self-corrects; the alternative was a ring
+    # that never worked at all.
+    assert saved.last_prompt_tokens == 4
     assert stream_id not in STREAMS
     assert captured["url"] == "http://gateway.local/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
@@ -1601,3 +1610,406 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
     finally:
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+
+
+def test_gateway_stream_usage_survives_junk_and_overflow():
+    """A bad provider token count must not cost the turn its transcript.
+
+    int() on a string/dict/overflowing usage field used to raise inside the SSE
+    read loop, where the outer `except Exception` converted it into "Gateway
+    request failed" and discarded everything the turn had streamed. Each junk
+    key must be skipped, and a good key later in the same chunk still wins.
+    """
+    from api.gateway_chat import _gateway_stream_usage
+
+    # Junk of every shape the wire can carry, including 1e999 -> inf.
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": "not-a-number"}}) == {
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
+    }
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": {"nested": 1}}})["input_tokens"] == 0
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": 1e999}})["input_tokens"] == 0
+    assert _gateway_stream_usage({"usage": {"prompt_tokens": float("nan")}})["input_tokens"] == 0
+    # Junk in the first key must fall through to the good alias, not abort.
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": "junk", "input_tokens": 25546}}
+    )["input_tokens"] == 25546
+    # A non-numeric cost must not poison the whole dict either.
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "estimated_cost": "free"}}
+    ) == {"input_tokens": 7, "output_tokens": 0, "estimated_cost": 0}
+    # Hermes gateway extras appear only when sent, so an older gateway keeps the
+    # legacy three-key shape and cannot zero a good session value.
+    assert "last_prompt_tokens" not in _gateway_stream_usage({"usage": {"prompt_tokens": 7}})
+    _rich = _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "last_prompt_tokens": 26194, "threshold_tokens": 750000}}
+    )
+    assert _rich["last_prompt_tokens"] == 26194
+    assert _rich["threshold_tokens"] == 750000
+    # Junk in an extra must be dropped, not raised and not written as garbage.
+    assert "threshold_tokens" not in _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 7, "threshold_tokens": "lots"}}
+    )
+
+
+def _run_gateway_turn(tmp_path, monkeypatch, session, usage_json, *, model="test-model", out=None):
+    """Drive one gateway turn against a canned terminal usage block.
+
+    Returns the request body the worker actually sent, so the provider-prefix
+    strip can be asserted from the wire rather than from an internal. Pass a
+    dict as `out` to also get the "done" SSE event's `usage` payload back via
+    out["done_usage"] - what static/ui.js's context ring actually reads on a
+    session's first turn, before the browser has any cached session to
+    backfill from (see the comment above the done-event backfill block in
+    api/gateway_chat.py).
+    """
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}],"usage":' + usage_json.encode() + b'}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    def fake_urlopen(req, timeout=0):
+        captured["body"] = req.data.decode("utf-8")
+        return FakeResponse()
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
+        "status": "not_configured", "source": "none", "label": "",
+        "message_count": 0, "messages": [],
+    })
+    monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda ctx, cfg: [])
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
+
+    stream_id = f"stream-{id(usage_json)}-{len(session.messages)}"
+    session.active_stream_id = stream_id
+    session.pending_user_message = "hi"
+    session.pending_attachments = []
+    session.pending_started_at = 123
+    session.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        session.session_id, "hi", model, str(tmp_path), stream_id, [],
+    )
+    if out is not None:
+        out["done_usage"] = None
+        while not subscriber.empty():
+            item = subscriber.get_nowait()
+            event, data = item[0], item[1]
+            if event == "done":
+                out["done_usage"] = (data or {}).get("usage")
+    return captured.get("body", "")
+
+
+def test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total(tmp_path, monkeypatch):
+    """A gateway that never sends last_prompt_tokens must never let the
+    context-ring numerator drift to the cumulative billing total - regression
+    #1436 introduced last_prompt_tokens to stop this exact failure mode.
+
+    CONTRACT CHANGE. This test used to assert the numerator stayed None while
+    the field was absent, on the premise that absence is an older gateway's
+    edge case. It is not: a Hermes agent never sends the field on either API
+    path (gateway/platforms/api_server_runs.py::_USAGE_FIELDS is the whole
+    terminal contract - input/output/total tokens plus, since 0.21.3, the two
+    cache counters; chat/completions reports the same session counters).
+    Checked against 0.21.0 and 0.21.3. "Absent means untouched" therefore
+    means "no numerator, ever", and static/ui.js falls through to lifetime
+    in+out - which is #1436 itself, arrived at from the other direction.
+
+    So the numerator is now this turn's prompt slice. What this test actually
+    guards is unchanged and still holds: it must never become the lifetime
+    sum. The tool-free gate keyed on an empty STREAM_LIVE_TOOL_CALLS is NOT
+    restored - that inference really was unreliable, since an empty list only
+    proves no tool-progress events were received.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    # No last_prompt_tokens on the wire at all: every Hermes agent.
+    _run_gateway_turn(tmp_path, monkeypatch, s, '{"prompt_tokens":1000,"completion_tokens":10}')
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 1000, "this turn's prompt slice stands in for the wire value"
+    assert saved.input_tokens == 1000, "the billing total still accumulates independently"
+
+    _run_gateway_turn(tmp_path, monkeypatch, saved, '{"prompt_tokens":1200,"completion_tokens":10}')
+    saved = models.get_session(s.session_id)
+    assert saved.input_tokens == 2200, "billing total keeps accumulating"
+    assert saved.last_prompt_tokens == 1200, "the numerator tracks the latest turn"
+    assert saved.last_prompt_tokens != saved.input_tokens, (
+        "must never silently become the 2200 lifetime sum just because two "
+        "turns went by - that is regression #1436 itself"
+    )
+
+
+def test_gateway_persists_the_cache_token_split_across_turns(tmp_path, monkeypatch):
+    """cache_read/cache_write are parsed, so they must also be persisted.
+
+    static/messages.js:6055/6134 derives the per-turn cache badge by
+    subtracting the pre-turn session totals, exactly as it does for
+    input/output - so these belong in the same cumulative accumulation, or a
+    reload shows zero.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    usage = '{"prompt_tokens":10,"completion_tokens":2,"cache_read_tokens":300,"cache_write_tokens":40}'
+    _run_gateway_turn(tmp_path, monkeypatch, s, usage)
+    _run_gateway_turn(tmp_path, monkeypatch, models.get_session(s.session_id), usage)
+
+    saved = models.get_session(s.session_id)
+    assert saved.cache_read_tokens == 600
+    assert saved.cache_write_tokens == 80
+
+
+def test_gateway_provider_prefix_strip_keeps_colon_tagged_and_host_port_models(tmp_path, monkeypatch):
+    """@provider:model must not lose the model's own colon segment.
+
+    rsplit(":", 1) turns "@openrouter:meta/llama-4:free" into "free"; a plain
+    split(":", 1) would instead turn "@custom:myhost:8080:m" into
+    "myhost:8080:m". The shared #6722 parser knows both grammars, so both the
+    request body and the context-length lookup delegate to it.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    body = _run_gateway_turn(
+        tmp_path, monkeypatch, s, '{"prompt_tokens":5,"completion_tokens":1}',
+        model="@openrouter:meta/llama-4:free",
+    )
+    assert json.loads(body)["model"] == "meta/llama-4:free"
+
+    from api.routes import _split_provider_qualified_model
+
+    assert _split_provider_qualified_model("@openrouter:meta/llama-4:free")[0] == "meta/llama-4:free"
+    # #1776's example: a custom-provider slug derived from base_url authority
+    # (host:port) must not be mistaken for an eaten model-tag colon.
+    assert _split_provider_qualified_model("@custom:10.8.71.41:8080:Qwen3") == (
+        "Qwen3", "custom:10.8.71.41:8080",
+    )
+
+
+def test_gateway_stream_usage_rejects_non_finite_cost():
+    """estimated_cost: 1e999 becomes +inf in JSON, which then can't round-trip
+    through json.dumps for session persistence/restore - a poisoned session
+    that no longer loads in the browser. Reject non-finite, negative, and
+    bool costs at the parse boundary; a normal float still passes through.
+    """
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "estimated_cost": 1e999}}
+    )["estimated_cost"] == 0
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "estimated_cost": float("nan")}}
+    )["estimated_cost"] == 0
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "estimated_cost": -5.0}}
+    )["estimated_cost"] == 0
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "estimated_cost": True}}
+    )["estimated_cost"] == 0
+    assert _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "estimated_cost": 0.42}}
+    )["estimated_cost"] == 0.42
+
+    import json as _json
+    _json.dumps(_gateway_stream_usage({"usage": {"estimated_cost": 1e999}}))
+
+
+def test_gateway_stream_usage_preserves_explicit_zero_context_ring_fields():
+    """The producing gateway's ContextCompressor clamps its post-compaction
+    sentinel to a real 0 (hermes-agent#105905's max(0, ...)). That 0 must
+    survive parsing as a present key, not collapse into "key absent" the way
+    a falsy check would - otherwise WebUI can't tell "just compacted, numerator
+    is genuinely 0" from "older gateway never sent this field at all".
+    """
+    present_zero = _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "last_prompt_tokens": 0, "threshold_tokens": 0}}
+    )
+    assert "last_prompt_tokens" in present_zero and present_zero["last_prompt_tokens"] == 0
+    assert "threshold_tokens" in present_zero and present_zero["threshold_tokens"] == 0
+
+    absent = _gateway_stream_usage({"usage": {"prompt_tokens": 1}})
+    assert "last_prompt_tokens" not in absent
+    assert "threshold_tokens" not in absent
+
+    # cache tokens keep the old truthy-only behaviour - they are billing
+    # totals accumulated frame-by-frame, not a context-ring presence signal,
+    # and the review didn't flag them.
+    assert "cache_read_tokens" not in _gateway_stream_usage(
+        {"usage": {"prompt_tokens": 1, "cache_read_tokens": 0}}
+    )
+
+
+def test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untouched(
+    tmp_path, monkeypatch
+):
+    """End-to-end through _run_gateway_chat_streaming: an explicit
+    last_prompt_tokens=0 (post-compaction) must overwrite a stale nonzero
+    numerator, and must never be mistaken for an absent field.
+
+    That half is the point of the test and is unchanged. The absent-field half
+    changed with the fallback - see the CONTRACT CHANGE note on
+    test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    An absent field now yields this turn's prompt slice instead of leaving a
+    stale numerator standing, because on a Hermes agent the field is ALWAYS
+    absent and "leave it standing" leaves it standing at nothing.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":1000,"completion_tokens":10,"last_prompt_tokens":26257}',
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 26257
+
+    # Post-compaction turn: gateway sends an authoritative 0.
+    _run_gateway_turn(
+        tmp_path, monkeypatch, saved,
+        '{"prompt_tokens":50,"completion_tokens":5,"last_prompt_tokens":0}',
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 0, "an explicit 0 must be trusted, not treated as absent"
+
+    # Bump it back up, then take a turn with the field absent - which on a
+    # Hermes agent is every turn. A stale 26257 kept beside a 9000-token
+    # prompt is not "no claim", it is a wrong claim that never self-corrects.
+    saved.last_prompt_tokens = 26257
+    saved.save()
+    _run_gateway_turn(
+        tmp_path, monkeypatch, saved, '{"prompt_tokens":9000,"completion_tokens":10}',
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 9000, (
+        "with no wire signal the current turn's prompt slice replaces a stale "
+        "numerator; the removed tool-free gate is not what supplies it"
+    )
+
+
+def test_gateway_explicit_zero_threshold_survives_the_75_percent_default_and_done_event(
+    tmp_path, monkeypatch
+):
+    """threshold_tokens: 0 on the wire must reach BOTH the saved session and
+    the "done" event's usage payload untouched by the fabricated 75%-of-window
+    default - two separate spots downstream of the presence-sensitive parse
+    fix both re-introduced a truthiness check on an already-correct 0:
+
+      1. The "Auto-compress at X" tooltip default (`not (... or 0)`) treated
+         a persisted 0 as "never set" and overwrote it with
+         int(context_length * 0.75).
+      2. The done-event backfill (`not usage.get(_ck)`) treated a present-but-
+         zero usage["threshold_tokens"] the same way and replaced it with the
+         session's now-fabricated value.
+
+    A resolved positive context_length is required to reproduce both - the
+    75% default is a no-op without one.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    s.context_length = 1_000_000  # already resolved, so the denominator block no-ops
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":1000,"completion_tokens":10,"last_prompt_tokens":1000,"threshold_tokens":0}',
+        out=out,
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.threshold_tokens == 0, "an explicit wire zero must not become the 750000 default"
+    assert out["done_usage"]["threshold_tokens"] == 0, (
+        "the done event ui.js reads on a session's first turn must carry the same "
+        "zero the session persisted, not a value backfilled from a stale default"
+    )
+
+    # Follow-up turn from an older gateway that omits the field entirely: the
+    # persisted zero must stand, not be reinterpreted as "unset" a turn later.
+    _run_gateway_turn(
+        tmp_path, monkeypatch, models.get_session(s.session_id),
+        '{"prompt_tokens":50,"completion_tokens":5}',
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.threshold_tokens == 0, "an omitted field on a later turn must not revive the default"
+
+
+def test_gateway_that_never_sends_last_prompt_tokens_still_gets_a_ring_numerator(
+    tmp_path, monkeypatch
+):
+    """A Hermes agent sends no last_prompt_tokens, so the ring needs a fallback.
+
+    The runs API's whole terminal usage contract is
+    gateway/platforms/api_server_runs.py::_USAGE_FIELDS - input/output/total
+    tokens, plus the two cache counters since agent 0.21.3 - and the
+    chat/completions path reports the same session counters. Neither mentions
+    last_prompt_tokens (checked against 0.21.0 and 0.21.3), so trusting the
+    wire alone leaves the numerator unset forever. static/ui.js then takes its
+    `hasPromptTok` false branch and renders lifetime in+out instead: a number
+    that climbs every turn and is not a share of the window at all, which is
+    the #1436 regression the field exists to prevent.
+
+    The substitute is this turn's own prompt slice. It must be the SLICE: the
+    loop above rewrites usage["input_tokens"] into the session's lifetime
+    total, and using that would reproduce the very climb being fixed.
+    """
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    s = new_session()
+    s.context_length = 200_000  # resolved, so the ring has a denominator too
+    s.save()
+
+    out = {}
+    _run_gateway_turn(
+        tmp_path, monkeypatch, s,
+        '{"prompt_tokens":120000,"completion_tokens":800,"total_tokens":120800}',
+        out=out,
+    )
+    saved = models.get_session(s.session_id)
+    assert saved.last_prompt_tokens == 120_000, (
+        "with no last_prompt_tokens on the wire the ring must still get this turn's "
+        "prompt size, or it silently falls back to a meaningless lifetime total"
+    )
+    assert out["done_usage"]["last_prompt_tokens"] == 120_000, (
+        "the done event is what the ring reads on a session's first turn, before the "
+        "browser has a cached session to backfill from"
+    )
+
+    # The wire-value-wins and explicit-zero halves of the contract are pinned by
+    # test_gateway_context_ring_trusts_explicit_zero_and_leaves_absent_field_untouched;
+    # the cumulative-drift invariant by
+    # test_gateway_absent_last_prompt_tokens_never_inherits_the_billing_total.
+    # What is unique here is the done event: the ring reads it, not the session,
+    # on a session's first turn.
