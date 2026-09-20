@@ -279,6 +279,12 @@ HERMES_HOME=/tmp/hermes-test-home \
 HERMES_WEBUI_STATE_DIR=/tmp/hermes-test-state \
   python -m pytest -q -p no:cacheprovider ${PYTEST_ARGS:-}
 '@
+    # A PowerShell here-string carries CRLF, and bash reads the CR as part of the
+    # last token on every line: `set -euo pipefail` arrives as `pipefail\r`, which
+    # is not an option name, and -euo means the script dies there. The failure
+    # surfaces as "tests failed (exit 2)" with no test having run — indistinguishable
+    # from a real failure, which is how -Test looked broken rather than unused.
+    $script = $script -replace "`r`n", "`n"
     $rc = Invoke-Native 'docker' @(
         'run', '--rm',
         '-v', "${RepoRoot}:/src:ro",
