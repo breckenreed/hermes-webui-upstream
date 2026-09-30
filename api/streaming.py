@@ -3379,6 +3379,20 @@ _IMAGE_MAGIC: dict[bytes | None, frozenset[str]] = {
 }
 
 
+def _sniff_image_mime(head: bytes) -> str:
+    """Return the image MIME implied by *head*'s magic bytes, or ``''``.
+
+    Clients do not always name files after their real format — iOS in
+    particular hands over PNG screenshots as ``image.jpg`` — so the
+    extension-derived MIME can disagree with the bytes. Callers use this to
+    trust the content instead of the name.
+    """
+    for magic, mimes in _IMAGE_MAGIC.items():
+        if magic is not None and head.startswith(magic):
+            return next(iter(mimes))
+    return ''
+
+
 def _is_valid_image(path: Path, mime: str) -> bool:
     """Check that the file's first bytes match the expected image MIME type.
 
@@ -3567,6 +3581,11 @@ def _build_native_multimodal_message(workspace_ctx: str, msg_text: str, attachme
             if size <= 0 or size > _NATIVE_IMAGE_MAX_BYTES:
                 continue
             mime = str(att.get('mime') or '').strip() or (mimetypes.guess_type(path.name)[0] or '')
+            if mime.startswith('image/'):
+                # The stored MIME comes from the file name; prefer the bytes
+                # so a PNG named .jpg is embedded instead of silently dropped.
+                with path.open('rb') as fh:
+                    mime = _sniff_image_mime(fh.read(16)) or mime
             if not mime.startswith('image/') or not _is_valid_image(path, mime):
                 continue
             data = base64.b64encode(path.read_bytes()).decode('ascii')
