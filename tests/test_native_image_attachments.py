@@ -431,6 +431,40 @@ class TestBuildNativeMultimodalMessage:
             result = _build_native_multimodal_message('', 'hi', atts, str(root))
             assert isinstance(result, str)
 
+    def test_png_named_jpg_embedded_with_sniffed_mime(self):
+        """iOS names PNG screenshots image.jpg; the bytes must win over the name."""
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            img = root / 'image_1790703837_719A.jpg'
+            _make_png(img)
+            atts = _normalize_chat_attachments([{
+                'name': img.name, 'path': str(img),
+                'mime': 'image/jpeg', 'size': img.stat().st_size, 'is_image': True,
+            }])
+            result = _build_native_multimodal_message('', 'hi', atts, str(root))
+            assert isinstance(result, list)
+            assert len(result) == 2
+            assert result[1]['image_url']['url'].startswith('data:image/png;base64,')
+
+
+# ── upload MIME detection ────────────────────────────────────────────────────
+
+from api.upload import _upload_mime
+
+
+class TestUploadMime:
+    def test_png_bytes_named_jpg(self):
+        assert _upload_mime('image.jpg', b'\x89PNG\r\n\x1a\n' + b'\x00' * 8) == 'image/png'
+
+    def test_jpeg_bytes_named_png(self):
+        assert _upload_mime('shot.png', b'\xff\xd8\xff\xe0' + b'\x00' * 8) == 'image/jpeg'
+
+    def test_unrecognised_image_bytes_keep_name_guess(self):
+        assert _upload_mime('fake.png', b'plain text') == 'image/png'
+
+    def test_non_image_not_sniffed(self):
+        assert _upload_mime('notes.txt', b'\x89PNG\r\n\x1a\n') == 'text/plain'
+
 
 # ── _is_valid_image magic-byte checks ────────────────────────────────────────
 

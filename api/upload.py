@@ -109,6 +109,20 @@ def _sanitize_upload_name(filename: str) -> str:
     return safe_name
 
 
+def _upload_mime(safe_name: str, file_bytes: bytes) -> str:
+    """MIME for an uploaded file: the name's guess, corrected by image magic bytes.
+
+    iOS hands over PNG screenshots named ``image.jpg``; trusting the extension
+    would record ``image/jpeg`` and the native vision payload would later
+    reject the mismatch.
+    """
+    mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+    if mime.startswith('image/'):
+        from api.streaming import _sniff_image_mime
+        mime = _sniff_image_mime(file_bytes[:16]) or mime
+    return mime
+
+
 def _attachment_root() -> Path:
     """Return the configured upload inbox root.
 
@@ -238,7 +252,7 @@ def handle_upload(handler):
             return j(handler, {'error': 'Upload destination rejected'}, status=403)
         with os.fdopen(_wfd, 'wb', closefd=True) as _wfh:
             _wfh.write(file_bytes)
-        mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+        mime = _upload_mime(safe_name, file_bytes)
         return j(handler, {
             'filename': dest.name,
             'path': str(dest),
@@ -701,7 +715,7 @@ def handle_workspace_upload(handler):
                 return j(handler, {'error': f'Path traversal blocked: {safe_name}'}, status=403)
             with os.fdopen(_wfd, 'wb', closefd=True) as _wfh:
                 _wfh.write(file_bytes)
-            mime = mimetypes.guess_type(safe_name)[0] or 'application/octet-stream'
+            mime = _upload_mime(safe_name, file_bytes)
 
             # For archives, optionally extract into the target directory.
             # Suffix set MUST match extract_archive()'s supported formats, else
