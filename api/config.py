@@ -68,6 +68,21 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
         return default
     return value if value >= minimum else default
 
+
+def _env_int_clamped(name: str, default: int, *, minimum: int = 1, maximum: int) -> int:
+    """Like ``_env_int``, then clamp a valid override to ``maximum``."""
+    value = _env_int(name, default, minimum=minimum)
+    if not str(os.getenv(name) or "").strip():
+        return value
+    return min(value, maximum)
+
+
+# Sidebar recency window. Resolved here, before profile init, so a profile
+# .env cannot override a server-wide resource bound. Clamped at 200.
+CLI_VISIBLE_SESSION_LIMIT = _env_int_clamped(
+    "HERMES_WEBUI_VISIBLE_SESSION_LIMIT", 20, maximum=200,
+)
+
 # ── TLS/HTTPS config (optional, env-overridable) ────────────────────────────
 TLS_CERT = os.getenv("HERMES_WEBUI_TLS_CERT", "").strip() or None
 TLS_KEY = os.getenv("HERMES_WEBUI_TLS_KEY", "").strip() or None
@@ -83,10 +98,19 @@ STATE_DIR = (
     .resolve()
 )
 
+
+def _resolve_settings_file(state_dir: Path) -> Path:
+    """Resolve an optional per-instance settings file without splitting session state."""
+    configured = os.getenv("HERMES_WEBUI_SETTINGS_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return state_dir / "settings.json"
+
+
 SESSION_DIR = STATE_DIR / "sessions"
 WORKSPACES_FILE = STATE_DIR / "workspaces.json"
 SESSION_INDEX_FILE = SESSION_DIR / "_index.json"
-SETTINGS_FILE = STATE_DIR / "settings.json"
+SETTINGS_FILE = _resolve_settings_file(STATE_DIR)
 LAST_WORKSPACE_FILE = STATE_DIR / "last_workspace.txt"
 PROJECTS_FILE = STATE_DIR / "projects.json"
 
@@ -552,6 +576,7 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
     # Remember the old mtime so we can tell whether config actually changed
     # vs. first-ever load (mtime == 0.0, e.g. server start or profile switch).
     _old_cfg_mtime = _cfg_mtime
+    _old_cfg_path = _cfg_path
     _cfg_path = config_path
     _cfg_mtime = 0.0
     try:
@@ -608,10 +633,11 @@ def _refresh_config_cache(config_path: Path | None = None) -> None:
     _cfg_fingerprint = _fingerprint_config(_cfg_cache)
     # Bust the models cache so the next request sees fresh config values.
     # Only delete the disk cache when config has actually changed -- not on
-    # first-ever load (when _old_cfg_mtime == 0.0, i.e. server start or
-    # profile switch) -- preserving the disk cache so the next restart
+    # first-ever load (when _old_cfg_mtime == 0.0, i.e. server start) and not
+    # on a path change (per-client profile switch leaves the old profile's
+    # mtime) -- preserving the disk cache so the next restart
     # still hits the fast path without a cold run.
-    if _old_cfg_mtime != 0.0:
+    if _old_cfg_mtime != 0.0 and _old_cfg_path == config_path:
         _delete_models_cache_on_disk()
 
 
@@ -652,7 +678,7 @@ def _load_yaml_config_file_raw(config_path: Path, *, _copy: bool = True) -> dict
     mutates its input) pass _copy=False to skip the redundant copy on the hot path.
     """
     try:
-        import yaml as _yaml
+        from api import yaml_compat as _yaml
     except ImportError:
         return {}
 
@@ -788,7 +814,7 @@ def _config_for_yaml_save(config_data: dict) -> dict:
 
 def _save_yaml_config_file(config_path: Path, config_data: dict) -> None:
     try:
-        import yaml as _yaml
+        from api import yaml_compat as _yaml
     except ImportError as exc:
         raise RuntimeError("PyYAML is required to write Hermes config.yaml") from exc
 
@@ -1763,26 +1789,21 @@ _PROVIDER_MODELS = {
     ],
     "openai": [
         {"id": "gpt-5.5",      "label": "GPT-5.5"},
-        {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.4",      "label": "GPT-5.4"},
     ],
     "openai-api": [
         {"id": "gpt-5.5",      "label": "GPT-5.5"},
-        {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
         {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
         {"id": "gpt-5.4",      "label": "GPT-5.4"},
     ],
     "openai-codex": [
-        {"id": "gpt-5.5", "label": "GPT-5.5"},
-        {"id": "gpt-5.5-mini", "label": "GPT-5.5 Mini"},
-        {"id": "gpt-5.4", "label": "GPT-5.4"},
-        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
-        {"id": "gpt-5.3-codex", "label": "GPT-5.3 Codex"},
-        {"id": "gpt-5.2-codex", "label": "GPT-5.2 Codex"},
-        {"id": "gpt-5.1-codex-max", "label": "GPT-5.1 Codex Max"},
-        {"id": "gpt-5.1-codex-mini", "label": "GPT-5.1 Codex Mini"},
-        {"id": "codex-mini-latest", "label": "Codex Mini (latest)"},
+        {"id": "gpt-6-sol",      "label": "GPT-6 Sol"},
+        {"id": "gpt-6-luna",     "label": "GPT-6 Luna"},
+        {"id": "gpt-5.6-sol",    "label": "GPT-5.6 Sol"},
+        {"id": "gpt-5.6-terra",  "label": "GPT-5.6 Terra"},
+        {"id": "gpt-5.6-luna",   "label": "GPT-5.6 Luna"},
+        {"id": "gpt-5.5",        "label": "GPT-5.5"},
     ],
     "google": [
         {"id": "gemini-3.1-pro-preview",            "label": "Gemini 3.1 Pro Preview"},
@@ -1904,28 +1925,44 @@ _PROVIDER_MODELS = {
         {"id": "big-pickle", "label": "Big Pickle"},
     ],
     # OpenCode Go — flat-rate models via opencode.ai/go ($10/month).
-    # Synced 2026-07-08 from the public Go docs and documented models endpoint.
-    # Keep preview/free-only Zen models out of this Go picker snapshot.
+    # Fallback only: the live Hermes CLI catalog (Go-specific
+    # /zen/go/v1/models probe, core v0.20.5+) leads (#1240, #5311).
+    # Mirrors Hermes core's curated opencode-go list
+    # (hermes_cli/models_catalog_static.py, core main as of 2026-09-10).
+    # Core's 2026-09-09 sync dropped `ox-alpha-free` (Go relay delisted it:
+    # GET /zen/go/v1/models omits it, POST → 401) and added `glm-5.3-flash`
+    # and `muse-spark-1.3-contributor`. Core owns the sync duty against the
+    # live endpoint; WebUI mirrors.
     "opencode-go": [
-        {"id": "minimax-m3",       "label": "MiniMax M3"},
-        {"id": "minimax-m2.7",     "label": "MiniMax M2.7"},
-        {"id": "minimax-m2.5",     "label": "MiniMax M2.5"},
-        {"id": "kimi-k2.7-code",   "label": "Kimi K2.7 Code"},
-        {"id": "kimi-k2.6",        "label": "Kimi K2.6"},
-        {"id": "kimi-k2.5",        "label": "Kimi K2.5"},
-        {"id": "glm-5.2",          "label": "GLM-5.2"},
-        {"id": "glm-5.1",          "label": "GLM-5.1"},
-        {"id": "glm-5",            "label": "GLM-5"},
-        {"id": "deepseek-v4-pro",  "label": "DeepSeek V4 Pro"},
-        {"id": "deepseek-v4-flash","label": "DeepSeek V4 Flash"},
-        {"id": "qwen3.7-max",      "label": "Qwen3.7 Max"},
-        {"id": "qwen3.7-plus",     "label": "Qwen3.7 Plus"},
-        {"id": "qwen3.6-plus",     "label": "Qwen3.6 Plus"},
-        {"id": "qwen3.5-plus",     "label": "Qwen3.5 Plus"},
-        {"id": "mimo-v2-pro",      "label": "MiMo V2 Pro"},
-        {"id": "mimo-v2-omni",     "label": "MiMo V2 Omni"},
-        {"id": "mimo-v2.5-pro",    "label": "MiMo V2.5 Pro"},
-        {"id": "mimo-v2.5",        "label": "MiMo V2.5"},
+        {"id": "kimi-k3",                  "label": "Kimi K3"},
+        {"id": "kimi-k2.7-code",           "label": "Kimi K2.7 Code"},
+        {"id": "kimi-k2.6",                "label": "Kimi K2.6"},
+        {"id": "kimi-k2.5",                "label": "Kimi K2.5"},
+        {"id": "gpt-5.6-luna",             "label": "GPT 5.6 Luna"},
+        {"id": "grok-4.5",                 "label": "Grok 4.5"},
+        {"id": "glm-5.3",                  "label": "GLM-5.3"},
+        {"id": "glm-5.3-flash",            "label": "GLM-5.3 Flash"},
+        {"id": "glm-5.2",                  "label": "GLM-5.2"},
+        {"id": "glm-5.1",                  "label": "GLM-5.1"},
+        {"id": "glm-5",                    "label": "GLM-5"},
+        {"id": "mimo-v2.5-pro",            "label": "MiMo V2.5 Pro"},
+        {"id": "mimo-v2.5",                "label": "MiMo V2.5"},
+        {"id": "mimo-v2-pro",              "label": "MiMo V2 Pro"},
+        {"id": "mimo-v2-omni",             "label": "MiMo V2 Omni"},
+        {"id": "minimax-m3",               "label": "MiniMax M3"},
+        {"id": "minimax-m2.7",             "label": "MiniMax M2.7"},
+        {"id": "minimax-m2.5",             "label": "MiniMax M2.5"},
+        {"id": "deepseek-v4-pro",          "label": "DeepSeek V4 Pro"},
+        {"id": "deepseek-v4-flash",        "label": "DeepSeek V4 Flash"},
+        {"id": "qwen3.8-max",              "label": "Qwen3.8 Max"},
+        {"id": "qwen3.7-max",              "label": "Qwen3.7 Max"},
+        {"id": "qwen3.7-plus",             "label": "Qwen3.7 Plus"},
+        {"id": "qwen3.6-plus",             "label": "Qwen3.6 Plus"},
+        {"id": "qwen3.5-plus",             "label": "Qwen3.5 Plus"},
+        {"id": "hy3",                      "label": "HY3"},
+        {"id": "hy3-preview",              "label": "HY3 Preview"},
+        {"id": "muse-spark-1.2-contributor", "label": "Muse Spark 1.2 Contributor"},
+        {"id": "muse-spark-1.3-contributor", "label": "Muse Spark 1.3 Contributor"},
     ],
     # 'gemini' is the hermes_cli provider ID for Google AI Studio
     # Model IDs are bare — sent directly to:
@@ -1986,11 +2023,12 @@ def _seed_provider_models_from_core() -> None:
     """Enrich existing provider model lists with missing IDs from hermes_cli.
 
     The core's _PROVIDER_MODELS is the authoritative curated list of agent-capable
-    models per provider.  The WebUI's static dict above is a display-oriented copy
-    (with {id, label} entries) that can go stale when new models are added to the
-    core without a matching WebUI update.  This function bridges the gap by
-    injecting any missing model IDs from the core into **existing** WebUI provider
-    entries.
+    models for ordinary providers.  The WebUI's static dict above is a
+    display-oriented copy (with {id, label} entries) that can go stale when new
+    models are added to the core without a matching WebUI update.  This function
+    bridges the gap by injecting any missing model IDs from the core into
+    **existing** WebUI provider entries.  OpenAI Codex is excluded because its
+    account-entitlement-aware live/cache path owns catalog freshness.
 
     Constrains seeding to providers already in the WebUI catalog — does NOT add
     brand-new providers.  Adding new vendors is a maintainer curation decision.
@@ -2021,6 +2059,8 @@ def _seed_provider_models_from_core() -> None:
             _webui_key_by_canonical[_canon] = _wk
 
     for provider_id, core_models in _core_pm.items():
+        if provider_id == "openai-codex":
+            continue
         if not isinstance(core_models, list):
             continue
 
@@ -3368,6 +3408,11 @@ CUSTOM_SELECTION_UNOWNED = (CUSTOM_SELECTION_MISSING, CUSTOM_SELECTION_MALFORMED
 CUSTOM_ROUTE_UNOWNED = "unowned_custom_provider"
 CUSTOM_ROUTE_NO_CREDENTIAL = "custom_provider_credential_unresolved"
 CUSTOM_ROUTE_NO_ENDPOINT = "custom_provider_endpoint_unresolved"
+# An opaque model-alias lane that no longer resolves to any configured alias
+# (deleted, renamed, owned by another profile, or targeting a different model).
+# Kept beside the custom-provider reasons because it travels the same terminal
+# verdict path: an unresolvable route must stop before any provider routing.
+MODEL_ALIAS_ROUTE_UNRESOLVED = "model_alias_route_unresolved"
 
 # Key the verdict travels under on a merged bundle. ``None`` == routable.
 CUSTOM_ROUTE_ERROR_FIELD = "route_error"
@@ -4815,6 +4860,11 @@ def model_with_provider_context(model_id: str, model_provider: str | None = None
     if _is_plugin_model_provider(provider):
         return f"@{provider}:{model}"
 
+    # Codex live/cache models are intentionally absent from the static catalog,
+    # so bare same-provider IDs can be claimed by overlapping providers.* entries.
+    if provider == "openai-codex":
+        return f"@{provider}:{model}"
+
     # If the selected provider is already the configured provider, leaving the
     # model bare preserves provider-specific base_url/proxy settings.
     if provider == config_provider:
@@ -6208,9 +6258,14 @@ def _model_supports_fast_tier_for_provider(model_id: str | None, provider: str |
 
 
 def _annotate_fast_tier_model_groups(payload: dict | None) -> dict | None:
-    """Add service-tier capability metadata to OpenAI-family model groups."""
+    """Add computed, browser-safe metadata to a model-catalog payload."""
     if not isinstance(payload, dict):
         return payload
+    routes = _public_model_alias_routes()
+    if routes:
+        payload["model_alias_routes"] = routes
+    else:
+        payload.pop("model_alias_routes", None)
     groups = payload.get("groups")
     if not isinstance(groups, list):
         return payload
@@ -6927,8 +6982,8 @@ def _configured_model_badges_from_static_catalog(
     for entry in configured_entries:
         provider = entry["provider"]
         model = entry["model"]
-        raw_candidates = []
-        for candidate in (model, f"{provider}/{model}", f"@{provider}:{model}"):
+        raw_candidates: list[str] = []
+        for candidate in (model, f"@{provider}:{model}"):
             if candidate and candidate not in raw_candidates:
                 raw_candidates.append(candidate)
 
@@ -7022,13 +7077,13 @@ def _minimal_static_models_catalog() -> dict:
         })
     except Exception:
         logger.debug("minimal static models catalog build failed", exc_info=True)
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": None,
             "default_model": "",
             "configured_model_badges": {},
             "groups": [],
             "aliases": {},
-        }
+        })
 
 
 def _static_models_catalog_without_live_probes() -> dict:
@@ -7367,17 +7422,7 @@ def _static_models_catalog_without_live_probes() -> dict:
 
         groups.sort(key=_group_sort_key)
 
-        model_aliases: dict[str, str] = {}
-        try:
-            raw_aliases = cfg.get("model", {}).get("aliases", {})
-            if isinstance(raw_aliases, dict):
-                model_aliases = {
-                    str(k).strip(): str(v).strip()
-                    for k, v in raw_aliases.items()
-                    if k and v
-                }
-        except Exception:
-            pass
+        model_aliases = _model_aliases_from_config()
 
         if not groups and default_model:
             return copy.deepcopy(_minimal_static_models_catalog())
@@ -7566,7 +7611,7 @@ _MODELS_CACHE_SCHEMA_VERSION = 3
 _models_cache_path = STATE_DIR / "models_cache.json"
 
 
-def _get_models_cache_path() -> Path:
+def _get_models_cache_path(profile: str | None = None) -> Path:
     """Return the /api/models disk-cache path for the *active* profile (#3957).
 
     WebUI profile switching is per-client/cookie scoped (issue #798), but the
@@ -7590,12 +7635,13 @@ def _get_models_cache_path() -> Path:
     The named-profile path is derived from ``_models_cache_path`` (the
     module-level default), not from ``STATE_DIR`` directly, so the path stays
     correct if the default is repointed (e.g. tests monkeypatch
-    ``_models_cache_path`` to an isolated tmp file).
+    ``_models_cache_path`` to an isolated tmp file). Pass *profile* to get
+    another profile's path (profile delete/create).
     """
     try:
         from api.profiles import get_active_profile_name, _is_root_profile
 
-        name = (get_active_profile_name() or "").strip()
+        name = (profile or get_active_profile_name() or "").strip()
         if not name or _is_root_profile(name):
             return _models_cache_path
         # Defensive filename sanitization: the cookie-derived profile name is
@@ -7882,6 +7928,96 @@ def _auth_store_semantic_fingerprint(path: Path) -> dict:
     return fp
 
 
+def _active_profile_home() -> Path:
+    try:
+        from api.profiles import get_active_hermes_home as _gah
+
+        return _gah()
+    except ImportError:
+        return _DEFAULT_HERMES_HOME
+
+
+def _models_cache_env_fingerprint(path: Path) -> list:
+    """``[key, HMAC(value)]`` per non-empty ``.env`` entry, parsed like provider detection.
+
+    Values are keyed-hashed with the WebUI signing key so the cache file never holds a secret.
+    """
+    import hmac
+    from api.auth import _signing_key
+    from api.providers import _load_env_file
+
+    key = _signing_key()
+    return [
+        [k, hmac.new(key, v.encode("utf-8"), hashlib.sha256).hexdigest()]
+        for k, v in sorted(_load_env_file(Path(path).expanduser()).items())
+        if v
+    ]
+
+
+def _declares_model_provider_kind(plugin_dir: Path) -> bool:
+    # Same parse as the agent's providers._declares_model_provider_kind: PyYAML, then a line scan.
+    for filename in ("plugin.yaml", "plugin.yml"):
+        manifest = plugin_dir / filename
+        if not manifest.is_file():
+            continue
+        try:
+            text = manifest.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return False
+        try:
+            from api import yaml_compat as _yaml
+
+            data = _yaml.safe_load(text)
+            if isinstance(data, dict):
+                return str(data.get("kind", "")).strip() == "model-provider"
+        except Exception:
+            pass
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or ":" not in stripped:
+                continue
+            key, _, value = stripped.partition(":")
+            if key.strip() == "kind":
+                return value.strip().strip("\"'") == "model-provider"
+        return False
+    return False
+
+
+def _models_cache_plugin_fingerprint(home: Path) -> list:
+    """``[dir, file stamps]`` per model-provider plugin, discovered like providers._scan_home_layer."""
+    found = []
+    plugins_root = Path(home).expanduser() / "plugins"
+    for base, flat in ((plugins_root / "model-providers", False), (plugins_root, True)):
+        try:
+            children = sorted(base.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir() or child.name.startswith(("_", ".")):
+                continue
+            if flat and (child.name == "model-providers" or not _declares_model_provider_kind(child)):
+                continue
+            found.append([str(child.relative_to(plugins_root)), _plugin_tree_stamps(child)])
+    return found
+
+
+def _plugin_tree_stamps(plugin_dir: Path) -> list:
+    # The loader execs __init__.py, which may import siblings or read data files; skip bytecode.
+    stamps = []
+    for root, dirs, files in os.walk(plugin_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__" and not d.startswith("."))
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            stamps.append([os.path.relpath(path, plugin_dir), st.st_mtime_ns, st.st_size])
+    return stamps
+
+
 def _models_cache_source_fingerprint() -> dict:
     """Return the current config/auth/catalog fingerprint for /api/models cache.
 
@@ -7893,9 +8029,12 @@ def _models_cache_source_fingerprint() -> dict:
     mtime/size fingerprint because it is only rewritten on deliberate user
     edits (which can change anything) and does not churn on a timer.
     """
+    home = _active_profile_home()
     return {
         "config_yaml": _models_cache_file_fingerprint(_get_config_path()),
         "auth_json": _auth_store_semantic_fingerprint(_get_auth_store_path()),
+        "env": _models_cache_env_fingerprint(home / ".env"),
+        "plugins": _models_cache_plugin_fingerprint(home),
         "catalog": _models_cache_catalog_fingerprint(),
     }
 
@@ -8023,24 +8162,363 @@ def _load_models_cache_from_disk() -> dict | None:
 
 
 def _model_aliases_from_config() -> dict[str, str]:
-    """Build the normalized model-alias map from current config.
-
-    Mirrors the alias construction used by the live and static catalog paths so
-    the `/api/models.aliases` contract is consistent across every catalog source
-    (live, static, and the stale-disk fallback, which can't read aliases from a
-    disk cache that never persisted them).
-    """
+    """Build the legacy string-alias map from current config."""
     try:
         raw_aliases = cfg.get("model", {}).get("aliases", {})
         if isinstance(raw_aliases, dict):
             return {
                 str(k).strip(): str(v).strip()
                 for k, v in raw_aliases.items()
-                if k and v
+                if k and v and isinstance(v, str)
             }
     except Exception:
         pass
     return {}
+
+
+_MODEL_ALIAS_ROUTE_PREFIX = "model-alias-"
+
+
+def _model_alias_route_provider(name: object) -> str:
+    """Return a stable opaque provider lane for one profile-local alias name."""
+    normalized = str(name or "").strip().lower()
+    try:
+        from api.profiles import get_active_hermes_home
+
+        profile_home = str(get_active_hermes_home().expanduser().resolve())
+    except Exception:
+        # The config path is the closest stable profile identity available during
+        # early imports and in reduced test environments.
+        profile_home = str(_get_config_path().expanduser().resolve().parent)
+    digest = hashlib.sha256(f"{profile_home}\0{normalized}".encode("utf-8")).hexdigest()
+    return f"{_MODEL_ALIAS_ROUTE_PREFIX}{digest}"
+
+
+def _configured_model_alias_entries(config_data: dict | None = None) -> dict[str, dict[str, str]]:
+    """Normalize canonical and legacy aliases with Hermes precedence."""
+    config_data = config_data if isinstance(config_data, dict) else cfg
+    entries: dict[str, dict[str, str]] = {}
+    canonical = config_data.get("model_aliases")
+    if isinstance(canonical, dict):
+        for raw_name, raw_entry in canonical.items():
+            name = str(raw_name or "").strip().lower()
+            if not name or not isinstance(raw_entry, dict):
+                continue
+            model = str(raw_entry.get("model") or "").strip()
+            if not model:
+                continue
+            entries[name] = {
+                "model": model,
+                "provider": str(raw_entry.get("provider") or "custom").strip() or "custom",
+                "base_url": str(raw_entry.get("base_url") or "").strip(),
+                "api_key": str(raw_entry.get("api_key") or "").strip(),
+                "key_env": str(raw_entry.get("key_env") or "").strip(),
+            }
+
+    model_section = config_data.get("model")
+    legacy = model_section.get("aliases") if isinstance(model_section, dict) else None
+    current_provider = str(model_section.get("provider") or "").strip() if isinstance(model_section, dict) else ""
+    if isinstance(legacy, dict):
+        for raw_name, raw_entry in legacy.items():
+            name = str(raw_name or "").strip().lower()
+            if not name or name in entries:
+                continue
+            if isinstance(raw_entry, dict):
+                model = str(raw_entry.get("model") or "").strip()
+                explicit_provider = str(raw_entry.get("provider") or "").strip()
+                base_url = str(raw_entry.get("base_url") or "").strip()
+                api_key = str(raw_entry.get("api_key") or "").strip()
+                key_env = str(raw_entry.get("key_env") or "").strip()
+                if not explicit_provider and not base_url:
+                    continue
+                provider = explicit_provider or current_provider or "custom"
+            elif isinstance(raw_entry, str) and raw_entry.strip():
+                value = raw_entry.strip()
+                if "/" not in value:
+                    continue
+                provider, model = value.split("/", 1)
+                provider, model, base_url = provider.strip(), model.strip(), ""
+                api_key, key_env = "", ""
+                if not provider:
+                    continue
+            else:
+                continue
+            if model:
+                entries[name] = {
+                    "model": model,
+                    "provider": provider or current_provider or "custom",
+                    "base_url": base_url,
+                    "api_key": api_key,
+                    "key_env": key_env,
+                }
+    return entries
+
+
+def _public_model_alias_routes() -> dict[str, dict[str, str]]:
+    """Return alias routes safe to expose through ``/api/models``.
+
+    Endpoint and credential fields remain server-side. The opaque provider lane
+    preserves exact alias/endpoint identity in session state without exposing a
+    credential-bearing URL or key material.
+    """
+    return {
+        name: {
+            "model": entry["model"],
+            "provider": entry["provider"],
+            "route_provider": _model_alias_route_provider(name),
+        }
+        for name, entry in _configured_model_alias_entries().items()
+    }
+
+
+def resolve_model_alias_runtime(
+    route_provider: str | None,
+    expected_model: str | None = None,
+) -> dict[str, object] | None:
+    """Resolve an opaque alias lane to server-side runtime routing material."""
+    route_provider = str(route_provider or "").strip().lower()
+    if not route_provider.startswith(_MODEL_ALIAS_ROUTE_PREFIX):
+        return None
+    aliases = _configured_model_alias_entries()
+    name = next(
+        (alias_name for alias_name in aliases if _model_alias_route_provider(alias_name) == route_provider),
+        None,
+    )
+    if name is None:
+        return None
+
+    configured = aliases[name]
+    resolved = dict(configured)
+    base_url_explicit = bool(configured.get("base_url"))
+    credential_explicit = bool(configured.get("api_key") or configured.get("key_env"))
+    # Hermes resolves a URL-bearing alias's credential for the alias HOST
+    # (requested="custom", which is host-gated), never for its provider label.
+    # That lookup provider is credential authority only; the alias's logical
+    # provider stays its routing/wire identity.
+    credential_lookup_provider = (
+        "custom" if base_url_explicit else str(configured.get("provider") or "custom").strip()
+    )
+    try:
+        from hermes_cli.model_switch import _load_direct_aliases, direct_alias_runtime_request
+
+        direct = _load_direct_aliases().get(name)
+        if direct is not None:
+            requested_provider, api_key = direct_alias_runtime_request(direct)
+            credential_lookup_provider = str(requested_provider or credential_lookup_provider).strip()
+            resolved = {
+                "model": str(direct.model or "").strip(),
+                "provider": str(direct.provider or requested_provider or "custom").strip(),
+                "base_url": str(direct.base_url or configured.get("base_url") or "").strip(),
+                "api_key": str(api_key or configured.get("api_key") or "").strip(),
+                "key_env": "" if api_key else str(configured.get("key_env") or "").strip(),
+            }
+    except Exception:
+        pass
+    resolved["credential_lookup_provider"] = credential_lookup_provider
+
+    resolved["alias"] = name
+    # Keep server-only provenance for composing aliases with named custom
+    # providers. An explicit alias endpoint is its own authority and must not be
+    # replaced by, or paired with credentials from, ``custom:<slug>`` config.
+    resolved["base_url_explicit"] = base_url_explicit
+    resolved["credential_explicit"] = credential_explicit
+    if expected_model and str(expected_model).strip() != resolved["model"]:
+        return None
+    raw_api_key = resolved.get("api_key", "")
+    if raw_api_key.startswith("${") and raw_api_key.endswith("}"):
+        resolved["api_key"] = _thread_local_env_value(raw_api_key[2:-1]).strip()
+    elif not raw_api_key and resolved.get("key_env"):
+        resolved["api_key"] = _thread_local_env_value(resolved["key_env"]).strip()
+    return resolved
+
+
+def is_model_alias_route_provider(route_provider: object) -> bool:
+    """True when ``route_provider`` is an opaque model-alias lane.
+
+    True whether or not the lane currently resolves: the lane is a WebUI-minted
+    identity for one alias name, so it identifies the alias route even when the
+    alias was deleted, belongs to another profile, or now targets a different
+    model. Callers use this to keep such a lane out of generic provider
+    resolution, which would read the opaque digest as a provider id.
+    """
+    return str(route_provider or "").strip().lower().startswith(_MODEL_ALIAS_ROUTE_PREFIX)
+
+
+def unresolved_model_alias_route_error() -> dict:
+    """Return the terminal verdict for an alias lane that resolved to nothing."""
+    return {
+        "reason": MODEL_ALIAS_ROUTE_UNRESOLVED,
+        "provider": None,
+        "message": (
+            "This session's model alias is not configured in the active profile: it "
+            "may have been deleted or renamed, or its target model may have changed."
+        ),
+        "hint": (
+            "Pick the model again (the /model command or the model selector), then "
+            "send again."
+        ),
+    }
+
+
+def raise_for_unresolved_model_alias_route(route_provider: object) -> None:
+    """Fail closed when an opaque alias lane no longer resolves.
+
+    No-op for a lane that is not a ``model-alias-*`` route. Otherwise raise the
+    terminal :class:`CustomProviderRouteError` so the caller stops before
+    generic provider resolution, before any AIAgent is constructed, and before
+    the agent cache is written — the opaque digest is not a provider id, and
+    resolving it as one can land on an ambient/fallback endpoint the user never
+    picked. The verdict carries no endpoint, credential, or alias-name detail.
+    """
+    if not is_model_alias_route_provider(route_provider):
+        return
+    verdict = unresolved_model_alias_route_error()
+    raise CustomProviderRouteError(
+        verdict["message"],
+        reason=verdict["reason"],
+        provider=verdict["provider"],
+        hint=verdict["hint"],
+    )
+
+
+def _same_endpoint_origin(url_a: object, url_b: object) -> bool:
+    """True only for an identical (scheme, host, port) origin; unknown is False."""
+    from urllib.parse import urlsplit
+
+    def _origin(url: object):
+        try:
+            parts = urlsplit(str(url or "").strip())
+            scheme = (parts.scheme or "").lower()
+            host = (parts.hostname or "").lower()
+            port = parts.port or {"https": 443, "http": 80}.get(scheme)
+        except ValueError:
+            return None
+        return (scheme, host, port) if scheme and host else None
+
+    origin_a = _origin(url_a)
+    return origin_a is not None and origin_a == _origin(url_b)
+
+
+def _model_alias_endpoint_api_mode(provider: str, base_url: str | None, model: object) -> str | None:
+    """Wire protocol for a URL-bearing alias, via Hermes' own detection.
+
+    Mirrors Hermes Agent, which clears the mode for a direct-alias endpoint and
+    re-detects it from the alias's logical provider plus its host. ``None``
+    (agent-side detection) when the installed Hermes cannot answer.
+    """
+    try:
+        from hermes_cli.providers import determine_api_mode
+
+        return determine_api_mode(provider, base_url or "", model=str(model or "")) or None
+    except Exception:
+        return None
+
+
+def merge_model_alias_runtime_bundle(
+    alias_route: dict,
+    runtime_provider: dict | None = None,
+    *,
+    connection_resolver=None,
+) -> dict:
+    """Compose one alias route with provider runtime state without mixing authorities.
+
+    An alias-declared ``base_url`` owns the endpoint boundary, matching Hermes
+    Agent's direct-alias contract (``_apply_direct_alias_endpoint``): the alias's
+    declared credential wins; otherwise the only credential that may accompany
+    it is one the caller resolved host-gated against the alias URL itself (see
+    ``direct_alias_runtime_request``), and only when that runtime reports the
+    alias's own origin. An unrelated provider credential never crosses to it.
+    The alias's logical provider remains its identity and selects the wire
+    protocol together with the alias host; the host-gated ``custom`` lookup is
+    credential authority only. When the alias names only a provider, normal
+    provider resolution remains authoritative. A credential-only alias may
+    override that provider's credential, but not its endpoint or wire protocol,
+    and it clears the provider credential pool it displaced.
+    """
+    route = alias_route if isinstance(alias_route, dict) else {}
+    runtime = runtime_provider if isinstance(runtime_provider, dict) else {}
+    provider = str(route.get("provider") or runtime.get("provider") or "").strip() or None
+    explicit_base_url = bool(route.get("base_url_explicit"))
+    explicit_credential = bool(route.get("credential_explicit"))
+    alias_api_key = route.get("api_key") or None
+
+    if explicit_base_url:
+        alias_base_url = route.get("base_url") or None
+        logical_provider = str(route.get("provider") or "").strip()
+        # WebUI canonicalizes named custom providers to "custom" everywhere.
+        bundle_provider = (
+            "custom"
+            if not logical_provider or logical_provider.lower().startswith("custom")
+            else logical_provider
+        )
+        if explicit_credential:
+            api_key = alias_api_key
+        else:
+            runtime_key = str(runtime.get("api_key") or "").strip()
+            if runtime_key == "no-key-required" or not _same_endpoint_origin(
+                runtime.get("base_url"), alias_base_url
+            ):
+                runtime_key = ""
+            api_key = runtime_key or KEYLESS_CUSTOM_API_KEY
+        bundle = {
+            "provider": bundle_provider,
+            "base_url": alias_base_url,
+            "api_key": api_key,
+            "api_mode": _model_alias_endpoint_api_mode(
+                logical_provider or bundle_provider, alias_base_url, route.get("model")
+            ),
+            "acp_command": None,
+            "acp_args": None,
+            "credential_pool": None,
+            CUSTOM_ROUTE_ERROR_FIELD: None,
+        }
+        if explicit_credential and not alias_api_key:
+            bundle[CUSTOM_ROUTE_ERROR_FIELD] = _custom_route_verdict(
+                CUSTOM_ROUTE_NO_CREDENTIAL,
+                provider or f"model alias {route.get('alias') or '<unknown>'}",
+            )
+        return bundle
+
+    resolved_provider = provider
+    resolved_api_key = runtime.get("api_key")
+    resolved_base_url = runtime.get("base_url")
+    if isinstance(provider, str) and provider.lower().startswith("custom:"):
+        bundle = merge_custom_provider_runtime_bundle(
+            resolved_provider,
+            resolved_api_key,
+            resolved_base_url,
+            runtime,
+            lookup_provider=provider,
+            connection_resolver=connection_resolver,
+        )
+    else:
+        bundle = {
+            "provider": resolved_provider,
+            "base_url": resolved_base_url,
+            "api_key": resolved_api_key,
+            "api_mode": runtime.get("api_mode"),
+            "acp_command": runtime.get("acp_command", runtime.get("command")),
+            "acp_args": runtime.get("acp_args", runtime.get("args")),
+            "credential_pool": runtime.get("credential_pool"),
+            CUSTOM_ROUTE_ERROR_FIELD: None,
+        }
+
+    if explicit_credential:
+        bundle["api_key"] = alias_api_key
+        bundle["credential_pool"] = None
+        if alias_api_key and bundle.get("base_url"):
+            # The alias supplied the credential the provider bundle lacked; the
+            # pair is now complete, so a prior missing-credential verdict no
+            # longer applies. Endpoint/unowned verdicts remain terminal.
+            verdict = bundle.get(CUSTOM_ROUTE_ERROR_FIELD)
+            if not verdict or verdict.get("reason") == CUSTOM_ROUTE_NO_CREDENTIAL:
+                bundle[CUSTOM_ROUTE_ERROR_FIELD] = None
+        elif not alias_api_key:
+            bundle[CUSTOM_ROUTE_ERROR_FIELD] = _custom_route_verdict(
+                CUSTOM_ROUTE_NO_CREDENTIAL,
+                provider or f"model alias {route.get('alias') or '<unknown>'}",
+            )
+    return bundle
 
 
 def _load_stale_models_cache_from_disk() -> dict | None:
@@ -8049,10 +8527,10 @@ def _load_stale_models_cache_from_disk() -> dict | None:
     The main cache loader enforces metadata stamps for a full cold-path cache hit.
     This helper intentionally does not apply that stricter policy, so we can still
     recover a useful fallback payload when the strict loader rejected cache because
-    metadata or fingerprint fields are stale. It DOES still enforce the schema
-    version: a cross-schema cache can have an incompatible groups/badge shape, so
-    serving it to the picker could surface a broken catalog — schema mismatch is a
-    hard reject even on the fallback path.
+    the WebUI version stamp is stale. It DOES still enforce the schema version (a
+    cross-schema cache can have an incompatible groups/badge shape) and the source
+    fingerprint: a snapshot built from other config/auth/.env/plugin sources is a
+    wrong catalog, not merely an old one, so it is never served.
     """
     try:
         import json as _j
@@ -8065,6 +8543,8 @@ def _load_stale_models_cache_from_disk() -> dict | None:
         if not _is_valid_models_cache(cache):
             return None
         if cache.get("_schema_version") != _MODELS_CACHE_SCHEMA_VERSION:
+            return None
+        if cache.get("_source_fingerprint") != _models_cache_source_fingerprint():
             return None
         aliases = cache.get("aliases")
         if not isinstance(aliases, dict):
@@ -8156,7 +8636,7 @@ def _get_fresh_memory_models_cache(now: float) -> dict | None:
     return None
 
 
-def invalidate_models_cache():
+def invalidate_models_cache(*, delete_disk: bool = True):
     """Force the TTL cache for get_available_models() to be cleared.
 
     Call this after modifying config.cfg in-memory (e.g. in tests) so
@@ -8169,6 +8649,8 @@ def invalidate_models_cache():
     that call invalidate_models_cache() still get back the previous test's
     result from the disk cache because the disk hit is checked before the memory
     cache rebuild runs.
+
+    ``delete_disk=False`` keeps the fingerprint-guarded disk snapshot (profile switch).
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
@@ -8187,7 +8669,8 @@ def invalidate_models_cache():
         _CREDENTIAL_POOL_CACHE.clear()
     # Also delete the disk cache so the next cold build starts fresh.
     # Disk delete is outside the lock — file I/O shouldn't block other readers.
-    _delete_models_cache_on_disk()
+    if delete_disk:
+        _delete_models_cache_on_disk()
     try:
         from api.plugin_providers import invalidate_plugin_model_provider_cache
 
@@ -8374,6 +8857,26 @@ def _read_live_provider_model_ids(provider_id: str) -> list[str]:
     return []
 
 
+def _hermes_cli_supports_opencode_go_live_catalog() -> bool:
+    """Whether the installed Agent has Go-specific model discovery.
+
+    Hermes core versions before 0.20.5 route ``opencode-go`` through a
+    generic public catalog. That lookup can return a convincing non-empty
+    list containing models the Go relay rejects with 404, so absence or an
+    unparseable/prerelease version must fail closed to WebUI's static Go list.
+    """
+    try:
+        import hermes_cli
+
+        version = str(getattr(hermes_cli, "__version__", "")).strip()
+    except Exception:
+        return False
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", version)
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) >= (0, 20, 5)
+
+
 def _models_from_live_provider_ids(provider_id: str, live_ids: list[str]) -> list[dict]:
     """Convert Hermes CLI model ids into WebUI picker model entries."""
     formatter = _format_ollama_label if provider_id in ("ollama", "ollama-cloud") else None
@@ -8415,9 +8918,9 @@ def _read_visible_codex_cache_model_ids() -> list[str]:
     """Return visible model slugs from Codex's local models_cache.json.
 
     The agent's provider_model_ids('openai-codex') intentionally filters IDs
-    with ``supported_in_api: false``. Codex CLI still lists some of those models
-    in its picker (notably ``gpt-5.3-codex-spark`` from #1680), so the WebUI
-    merges this visible local catalog to stay in sync with Codex itself.
+    with ``supported_in_api: false``. Codex's visible catalog may still include
+    some of those models, so the WebUI merges this local catalog with live
+    discovery.
     """
     codex_home = Path(os.getenv("CODEX_HOME", "").strip() or (HOME / ".codex")).expanduser()
     cache_path = codex_home / "models_cache.json"
@@ -8582,10 +9085,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             for entry in configured_entries:
                 provider = entry["provider"]
                 model = entry["model"]
-                raw_candidates = []
+                raw_candidates: list[str] = []
                 for candidate in (
                     model,
-                    f"{provider}/{model}",
                     f"@{provider}:{model}",
                 ):
                     if candidate and candidate not in raw_candidates:
@@ -9588,12 +10090,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if raw_models:
                         _append_picker_group(provider_name, pid, raw_models)
                 elif pid == "openai-codex":
-                    # Codex account catalogs drift faster than WebUI releases
-                    # (for example gpt-5.3-codex-spark in #1680). Ask the
-                    # agent's Codex resolver first so /api/models inherits the
-                    # live Codex API / local ~/.codex cache / static fallback
-                    # chain instead of freezing the picker to WebUI's curated
-                    # _PROVIDER_MODELS snapshot.
+                    # Codex account catalogs drift independently from WebUI
+                    # releases, so ask the agent's resolver first and merge the
+                    # visible local cache below before falling back to WebUI's
+                    # static _PROVIDER_MODELS snapshot.
                     raw_models = []
                     codex_ids = []
                     try:
@@ -9771,12 +10271,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if not raw_models:
                         if pid == "moa":
                             raw_models = _moa_preset_models_from_config(cfg)
-                        elif pid == "opencode-go":
-                            # Skip live /v1/models probe for OpenCode Go — it
-                            # returns models from the public catalog that are
-                            # not enabled on the Go tier, causing 404 when
-                            # selected. Use the curated static list only. (#5311)
-                            pass
+                        elif (
+                            pid == "opencode-go"
+                            and not _hermes_cli_supports_opencode_go_live_catalog()
+                        ):
+                            # Before core v0.20.5 this resolver returned the
+                            # generic public catalog, including models that
+                            # 404 on the Go tier. Use the curated Go fallback.
+                            raw_models = []
                         else:
                             raw_models = _models_from_live_provider_ids(
                                 pid,
@@ -9969,21 +10471,15 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         groups.sort(key=_group_sort_key)
 
         # 12. Include model aliases so the WebUI frontend can resolve them.
-        model_aliases: dict[str, str] = {}
-        try:
-            raw_aliases = cfg.get("model", {}).get("aliases", {})
-            if isinstance(raw_aliases, dict):
-                model_aliases = {str(k).strip(): str(v).strip() for k, v in raw_aliases.items() if k and v}
-        except Exception:
-            pass
+        model_aliases = _model_aliases_from_config()
 
-        return {
+        return _annotate_fast_tier_model_groups({
             "active_provider": active_provider,
             "default_model": default_model,
             "configured_model_badges": _build_configured_model_badges(),
             "groups": groups,
             "aliases": model_aliases,
-        }
+        })
 
     # ── FAST PATH ─────────────────────────────────────────────────────────────
     # Mark that a build may be in progress BEFORE acquiring the lock.
@@ -10264,7 +10760,8 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             # (#3957): the daemon inherits neither the request-profile TLS nor
             # os.environ, so without this it would probe the default profile's
             # credentials and, over budget, publish the rebuilt catalog to the
-            # DEFAULT profile's disk cache. No-op for the default profile.
+            # DEFAULT profile's disk cache. Default still binds request TLS but
+            # does not mirror a named-profile environment.
             _worker_scope = (
                 _prof_scope_worker(_active_profile_name, "models rebuild (worker)")
                 if _prof_scope_worker is not None
@@ -11431,7 +11928,13 @@ _SETTINGS_DEFAULTS = {
     "hidden_tabs": [],  # sidebar tab panel names hidden by user (e.g. ["tasks","kanban"]); chat and settings are always visible
     "tab_order": [],  # user-defined sidebar/rail tab order for reorderable tabs; chat/settings stay fixed
     "composer_control_order": [],  # user-defined composer footer control order; invalid/duplicate keys are ignored
-    "language": "en",  # UI locale code; must match a key in static/i18n.js LOCALES
+    # #7622 (round 3): language is intentionally absent from the defaults so
+    # `load_settings()` reports `None` for a fresh install.  This lets the
+    # client distinguish "no preference" from an explicit saved choice,
+    # so a user who genuinely picked English (and has `language: "en"`
+    # persisted on disk) is no longer overridden by the browser hint on
+    # their first hydration.  When a user picks a locale in the Settings
+    # modal the value is written here and the field is set explicitly.
     "bot_name": os.getenv(
         "HERMES_WEBUI_BOT_NAME", "Hermes"
     ),  # display name for the assistant
@@ -11671,6 +12174,16 @@ def load_settings() -> dict:
             settings["default_model_provider"] = str(model_cfg.get("provider"))
     except Exception:
         logger.debug("Failed to resolve default model provider for settings")
+    # #7622/#7730 (round 4): keep the tri-state signal explicit.  `language`
+    # is intentionally absent from `_SETTINGS_DEFAULTS` (see above), so
+    # without this line a fresh install's returned dict would OMIT the key
+    # entirely and the API payload would carry no `language` field.  Emit an
+    # explicit `None` (serialized as JSON `null`) so the client receives the
+    # three-way signal it trusts: `null` = no preference, "en" = explicitly
+    # saved English, any other code = explicitly chosen locale.  Stored
+    # values (including a legacy English pick written before this change)
+    # win via the merge above and are never touched here.
+    settings.setdefault("language", None)
     return settings
 
 
@@ -11678,6 +12191,15 @@ _SETTINGS_ALLOWED_KEYS = set(_SETTINGS_DEFAULTS.keys()) - {
     "password_hash",
     "default_model",
     "simplified_tool_calling",
+} | {
+    # #7622 (round 3): `language` is intentionally absent from
+    # `_SETTINGS_DEFAULTS` so a fresh install returns `None` for
+    # `settings["language"]` and the client can distinguish "no
+    # preference" from an explicit saved choice.  But the user
+    # MUST still be able to pick a locale in the Settings modal,
+    # so we add it back to the explicit allow-list here.  The
+    # existing BCP-47 validation at save-time still applies.
+    "language",
 }
 _SETTINGS_ENUM_VALUES = {
     "send_key": {"enter", "ctrl+enter", "shift+enter"},
