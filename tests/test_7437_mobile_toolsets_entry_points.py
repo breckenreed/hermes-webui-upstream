@@ -88,6 +88,7 @@ def _run(stage: str, click_target: str | None = None, viewport_width: int = 390)
             _function(src, "_activeToolsetsTrigger") if "_activeToolsetsTrigger" in src else "",
             _function(src, "_restoreToolsetsDropdownHome") if "_restoreToolsetsDropdownHome" in src else "",
             "let _toolsetsDropdownHome = null;" if "_toolsetsDropdownHome" in src else "",
+            "let _toolsetsOpenGeneration = 0;" if "_toolsetsOpenGeneration" in src else "",
             _function(src, "_positionToolsetsDropdown"),
             _function(src, "toggleToolsetsDropdown"),
             _function(src, "closeToolsetsDropdown"),
@@ -516,3 +517,318 @@ class TestPanelSheetLifecycle:
         assert out["toolsetsClosed"] == 0, (
             f"closeMobileComposerConfig() must not reach the toolsets picker; got {out}"
         )
+
+
+# ── Focus and resize ownership across the open lifetime ──────────────────────
+#
+# Everything above stubs the picker's renderer and catalog loader, so it cannot
+# see what happens when they run LATE. These tests run the real toolsets region
+# of ui.js - module state, renderer, catalog loader, and the document `change`
+# and window `resize` listeners it registers - against a small DOM that keeps
+# the one browser behaviour the defects live in: focus held by a node that gets
+# detached falls back to <body>. Timers and the catalog request are driven by
+# hand, so each test chooses the exact interleaving it is about.
+
+_REGION_START = "// ── Session toolsets chip (#493)"
+_REGION_END = "function _syncMobileComposerConfigButton"
+
+
+def _toolsets_region(src: str) -> str:
+    i = src.find(_REGION_START)
+    j = src.find(_REGION_END, i)
+    assert i != -1 and j != -1, "toolsets region markers not found in ui.js"
+    return src[i:j]
+
+
+_DOM_HARNESS = r"""
+const params = __PARAMS__;
+const docRoot = { tagName: 'HTML', children: [], parentNode: null, classList: { contains: () => false } };
+let activeEl = null;
+const docListeners = {};
+const winListeners = {};
+
+function matchesCompound(n, comp) {
+  if (!n || !n.tagName || !n.classList) return false;
+  const re = /([#.:]?)([\w-]+)/g;
+  let m;
+  while ((m = re.exec(comp))) {
+    const kind = m[1], name = m[2];
+    if (kind === '#') { if (n.id !== name) return false; }
+    else if (kind === '.') { if (!n.classList.contains(name)) return false; }
+    else if (kind === ':') { if (name !== 'checked' || !n.checked) return false; }
+    else if (n.tagName !== name.toUpperCase()) return false;
+  }
+  return true;
+}
+function matches(n, sel) {
+  return sel.split(',').some((s) => {
+    const parts = s.trim().split(/\s+/);
+    if (!matchesCompound(n, parts[parts.length - 1])) return false;
+    let anc = n.parentNode;
+    for (let i = parts.length - 2; i >= 0; i--) {
+      while (anc && !matchesCompound(anc, parts[i])) anc = anc.parentNode;
+      if (!anc) return false;
+      anc = anc.parentNode;
+    }
+    return true;
+  });
+}
+function queryAll(root, sel) {
+  const out = [];
+  (function walk(n) { (n.children || []).forEach((c) => { if (matches(c, sel)) out.push(c); walk(c); }); })(root);
+  return out;
+}
+function isConnected(n) { while (n) { if (n === docRoot) return true; n = n.parentNode; } return false; }
+
+function makeNode(tag) {
+  const cls = new Set();
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    id: '', type: '', value: '', checked: false, placeholder: '',
+    _text: '', style: {}, dataset: {}, children: [], parentNode: null,
+    offsetParent: {}, scrollHeight: 240, offsetHeight: 240, offsetWidth: 300, clientWidth: 390,
+    _attrs: {}, onkeydown: null, oninput: null,
+    classList: {
+      add: (c) => cls.add(c), remove: (c) => cls.delete(c), contains: (c) => cls.has(c),
+      toggle: (c, f) => { const on = f === undefined ? !cls.has(c) : !!f; if (on) cls.add(c); else cls.delete(c); return on; },
+    },
+    get textContent() { return this._text + this.children.map((c) => c.textContent).join(''); },
+    set textContent(v) { this._detachAll(); this._text = String(v); },
+    get innerHTML() { return ''; },
+    set innerHTML(v) {
+      if (v !== '') throw new Error('stub DOM supports innerHTML = "" only');
+      this._detachAll(); this._text = '';
+    },
+    _detachAll() { this.children.forEach((c) => { c.parentNode = null; }); this.children = []; },
+    appendChild(c) { if (c.parentNode) c.parentNode.removeChild(c); c.parentNode = this; this.children.push(c); return c; },
+    insertBefore(c, ref) {
+      if (c.parentNode) c.parentNode.removeChild(c);
+      c.parentNode = this;
+      const i = ref ? this.children.indexOf(ref) : -1;
+      if (i < 0) this.children.push(c); else this.children.splice(i, 0, c);
+      return c;
+    },
+    removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); c.parentNode = null; return c; },
+    get nextSibling() { const p = this.parentNode; if (!p) return null; return p.children[p.children.indexOf(this) + 1] || null; },
+    get isConnected() { return isConnected(this); },
+    contains(o) { let n = o; while (n) { if (n === this) return true; n = n.parentNode; } return false; },
+    setAttribute(k, v) { this._attrs[k] = String(v); },
+    getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+    // Browser semantics the defects depend on: focusing a detached node is a
+    // no-op, and activeElement falls back to <body> once the holder detaches.
+    focus() { if (isConnected(this)) activeEl = this; },
+    getBoundingClientRect() { return { left: 44, right: 88, top: 740, bottom: 784, width: 44, height: 44 }; },
+    querySelector(sel) { return queryAll(this, sel)[0] || null; },
+    querySelectorAll(sel) { return queryAll(this, sel); },
+    closest(sel) { let n = this; while (n && n !== docRoot) { if (matches(n, sel)) return n; n = n.parentNode; } return null; },
+  };
+  Object.defineProperty(node, 'className', {
+    get() { return Array.from(cls).join(' '); },
+    set(v) { cls.clear(); String(v).split(/\s+/).filter(Boolean).forEach((c) => cls.add(c)); },
+  });
+  return node;
+}
+function el(tag, id, className, parent) {
+  const n = makeNode(tag);
+  if (id) n.id = id;
+  if (className) n.className = className;
+  if (parent) parent.appendChild(n);
+  return n;
+}
+
+const body = el('body', '', '', null);
+docRoot.children.push(body); body.parentNode = docRoot;
+const composer = el('textarea', 'msg', '', body);
+const footer = el('div', '', 'composer-footer', body);
+footer.getBoundingClientRect = () => ({ left: 0, top: 700, bottom: 800, right: 390 });
+const chip = el('button', 'composerToolsetsChip', '', footer);
+const dd = el('div', 'composerToolsetsDropdown', 'composer-toolsets-dropdown', footer);
+el('div', 'toolsetsDropdownDesc', 'toolsets-dropdown-desc', dd);
+el('div', 'toolsetsDropdownState', 'toolsets-dropdown-state', dd);
+const inputRow = el('div', '', 'toolsets-dropdown-input-row', dd);
+const input = el('input', 'toolsetsInput', 'toolsets-input', inputRow);
+const actions = el('div', '', 'toolsets-dropdown-actions', dd);
+el('button', 'toolsetsApplyBtn', 'toolsets-action-btn toolsets-apply-btn', actions);
+el('button', 'toolsetsClearBtn', 'toolsets-action-btn toolsets-clear-btn', actions);
+const panel = el('div', 'composerMobileConfigPanel', '', body);
+const action = el('button', 'composerMobileToolsetsAction', '', panel);
+el('button', 'composerMobileConfigBtn', '', body);
+
+function setStage(stage) {
+  footer.classList.remove('cf-icons'); footer.classList.remove('cf-burger');
+  if (stage === 'icons' || stage === 'burger') footer.classList.add('cf-icons');
+  if (stage === 'burger') { footer.classList.add('cf-burger'); panel.classList.add('open'); }
+  else panel.classList.remove('open');
+  chip.offsetParent = (stage === 'icons' || stage === 'desktop') ? {} : null;
+  action.offsetParent = stage === 'burger' ? {} : null;
+}
+setStage(params.stage);
+
+const document = {
+  body, documentElement: docRoot,
+  get activeElement() { return activeEl && isConnected(activeEl) ? activeEl : body; },
+  createElement: (tag) => makeNode(tag),
+  createTextNode: (s) => { const n = makeNode('#text'); n._text = String(s); return n; },
+  getElementById: (id) => queryAll(docRoot, '#' + id)[0] || null,
+  querySelector: (sel) => queryAll(docRoot, sel)[0] || null,
+  querySelectorAll: (sel) => queryAll(docRoot, sel),
+  addEventListener: (type, fn) => { (docListeners[type] = docListeners[type] || []).push(fn); },
+};
+const window = {
+  visualViewport: { width: 390, height: 800, offsetTop: 0, offsetLeft: 0 },
+  innerWidth: 390, innerHeight: 800,
+  matchMedia: () => ({ matches: true }),
+  addEventListener: (type, fn) => { (winListeners[type] = winListeners[type] || []).push(fn); },
+};
+const $ = (id) => document.getElementById(id);
+
+const timers = [];
+const fakeSetTimeout = (fn) => { timers.push(fn); return timers.length; };
+function flushTimers() { while (timers.length) timers.shift()(); }
+
+const requests = [];
+const api = (url) => new Promise((resolve, reject) => requests.push({ url, resolve, reject }));
+const CATALOG = { servers: [{ name: 'alpha' }, { name: 'beta' }] };
+async function settleCatalog() {
+  while (requests.length) requests.shift().resolve(CATALOG);
+  for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+}
+
+const runner = new Function(
+  '$', 'document', 'window', 'api', 't', 'S', 'showToast', 'setTimeout', 'closeModelDropdown',
+  params.region + '\nreturn { toggleToolsetsDropdown, closeToolsetsDropdown, invalidateToolsetsCatalog };'
+);
+const ui = runner($, document, window, api, (k) => k, { session: null }, () => {}, fakeSetTimeout, () => {});
+
+function focusReport() {
+  const a = document.activeElement;
+  return {
+    open: dd.classList.contains('open'),
+    activeId: a.id || null,
+    activeTag: a.tagName,
+    activeValue: a.value || null,
+    activeConnected: isConnected(a) && a !== body,
+    activeInsideSheet: a !== body && dd.contains(a),
+  };
+}
+function fire(target, type, extra) {
+  (docListeners[type] || []).forEach((fn) => fn(Object.assign({ target }, extra || {})));
+}
+function resize() { (winListeners.resize || []).forEach((fn) => fn({})); }
+
+(async () => {
+  const s = params.scenario;
+  let out = {};
+  if (s === 'timer-then-catalog') {
+    // The re-gate's exact order: open, let the 50 ms callback focus the
+    // synchronously rendered defaults button, then let the catalog settle.
+    ui.toggleToolsetsDropdown();
+    flushTimers();
+    const before = focusReport();
+    await settleCatalog();
+    out = { before, after: focusReport() };
+  } else if (s === 'stale-timer-after-close') {
+    // Dismissed inside the 50 ms window, then the user moves on to typing.
+    ui.toggleToolsetsDropdown();
+    ui.closeToolsetsDropdown();
+    composer.focus();
+    flushTimers();
+    await settleCatalog();
+    out = focusReport();
+  } else if (s === 'reopen-before-settlement') {
+    ui.toggleToolsetsDropdown();
+    ui.closeToolsetsDropdown();
+    ui.toggleToolsetsDropdown();
+    flushTimers();
+    await settleCatalog();
+    out = focusReport();
+  } else if (s === 'checkbox-toggle') {
+    ui.invalidateToolsetsCatalog(CATALOG);
+    ui.toggleToolsetsDropdown();
+    await settleCatalog();
+    flushTimers();
+    const beta = dd.querySelectorAll('.toolsets-server-checkbox').find((c) => c.value === 'beta');
+    beta.focus();
+    beta.checked = true;
+    fire(beta, 'change');
+    out = Object.assign(focusReport(), {
+      inputValue: input.value,
+      betaStillChecked: !!(document.activeElement && document.activeElement.checked),
+    });
+  } else if (s.startsWith('resize-')) {
+    ui.invalidateToolsetsCatalog(CATALOG);
+    ui.toggleToolsetsDropdown();
+    const openedFloating = dd.classList.contains('composer-toolsets-dropdown--floating');
+    if (s === 'resize-none-rendered') { chip.offsetParent = null; action.offsetParent = null; }
+    dd.style.top = '';
+    resize();
+    out = {
+      openedFloating,
+      open: dd.classList.contains('open'),
+      repositioned: dd.style.top !== '',
+    };
+  }
+  console.log(JSON.stringify(out));
+})().catch((e) => { console.error(e && e.stack || e); process.exit(1); });
+"""
+
+
+def _run_region(scenario: str, stage: str = "burger") -> dict:
+    src = UI_JS_PATH.read_text(encoding="utf-8")
+    params = {"scenario": scenario, "stage": stage, "region": _toolsets_region(src)}
+    js = _DOM_HARNESS.replace("__PARAMS__", json.dumps(params))
+    r = subprocess.run([NODE, "-e", js], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"node failed: {r.stderr}")
+    return json.loads(r.stdout.strip().splitlines()[-1])
+
+
+class TestFocusAcrossTheOpenLifetime:
+    def test_focus_survives_the_catalog_settling_after_the_open_timer(self):
+        """The maintainer's re-gate order: timer first, catalog second.
+
+        The 50 ms callback focuses the synchronously rendered profile-defaults
+        button; the catalog continuation then re-rendered the whole section with
+        innerHTML = '', detaching that exact node and dropping focus to <body>
+        while the sheet stayed open.
+        """
+        out = _run_region("timer-then-catalog")
+        assert out["before"]["activeInsideSheet"], f"the open timer must focus inside the sheet; got {out}"
+        after = out["after"]
+        assert after["open"] is True, f"settling the catalog must not close the sheet; got {out}"
+        assert after["activeInsideSheet"] and after["activeConnected"], (
+            f"focus must still be on a live control inside the open sheet after the "
+            f"catalog settles, not fall back to <body>; got {out}"
+        )
+
+    def test_a_stale_open_timer_cannot_reclaim_focus_after_close(self):
+        """Dismiss inside the 50 ms window and start typing elsewhere.
+
+        The open's timer used to run regardless: with the sheet closed it took the
+        anchored branch and focused the hidden free-text field, yanking focus out
+        of the composer the user had just moved to.
+        """
+        out = _run_region("stale-timer-after-close")
+        assert out["open"] is False, f"the sheet was closed; got {out}"
+        assert out["activeId"] == "msg", (
+            f"a timer belonging to a closed open must not move focus; got {out}"
+        )
+
+    def test_reopening_before_the_catalog_settles_keeps_focus_in_the_sheet(self):
+        """Close and reopen while the first open's callbacks are still pending."""
+        out = _run_region("reopen-before-settlement")
+        assert out["open"] is True, f"the second open must stay open; got {out}"
+        assert out["activeInsideSheet"] and out["activeConnected"], (
+            f"neither open's late callbacks may leave focus outside the sheet; got {out}"
+        )
+
+    def test_toggling_a_server_checkbox_keeps_keyboard_focus_on_it(self):
+        """Pre-existing on master, same mechanism: the `change` handler re-rendered
+        every checkbox, so a keyboard user lost focus after each Space press."""
+        out = _run_region("checkbox-toggle")
+        assert out["inputValue"] == "beta", f"the selection must still reach the input; got {out}"
+        assert out["activeValue"] == "beta" and out["activeConnected"], (
+            f"focus must stay on the checkbox that was just toggled; got {out}"
+        )
+        assert out["betaStillChecked"] is True, f"and it must still read as checked; got {out}"
+

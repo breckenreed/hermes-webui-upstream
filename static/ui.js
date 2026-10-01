@@ -5488,6 +5488,11 @@ document.addEventListener('click',function(e){
 // ── Session toolsets chip (#493) ───────────────────────────────────────────
 let _currentSessionToolsets = null; // null = active profile defaults, array = custom list
 let _toolsetsCatalog = null;
+// Owner token for one open of the picker. Every open AND every close bumps it,
+// so a callback scheduled by an earlier open - the 50 ms focus timer, the
+// catalog continuation - can tell it has been superseded and stand down,
+// rather than act on a sheet that is closed or now belongs to a later open.
+let _toolsetsOpenGeneration = 0;
 
 function _applyToolsetsChip(toolsets) {
   _currentSessionToolsets = toolsets;
@@ -5591,6 +5596,24 @@ function _ensureToolsetsPresetSection() {
   section = document.createElement('div');
   section.id = 'toolsetsPresetSections';
   section.className = 'toolsets-preset-sections';
+  // Built once and never replaced. The defaults button is the open's focus
+  // fallback while the catalog is still loading, so it must be the SAME node
+  // when the catalog settles: re-creating it detached the focused element and
+  // dropped keyboard focus to <body> with the sheet still open. Only the server
+  // list below it is ever re-rendered.
+  const defaultsBtn = document.createElement('button');
+  defaultsBtn.type = 'button';
+  defaultsBtn.id = 'toolsetsProfileDefaultsBtn';
+  defaultsBtn.className = 'toolsets-action-btn toolsets-clear-btn';
+  section.appendChild(defaultsBtn);
+  const serversLabel = document.createElement('div');
+  serversLabel.id = 'toolsetsServersLabel';
+  serversLabel.className = 'toolsets-dropdown-desc';
+  section.appendChild(serversLabel);
+  const list = document.createElement('div');
+  list.id = 'toolsetsServerList';
+  list.className = 'toolsets-server-list';
+  section.appendChild(list);
   const inputRow = dd.querySelector('.toolsets-dropdown-input-row');
   if (inputRow) dd.insertBefore(section, inputRow);
   else dd.appendChild(section);
@@ -5616,43 +5639,61 @@ function _renderToolsetsPresetSections(opts) {
     ? '🔧 ' + selected.join(', ')
     : '👤 ' + t('session_toolsets_profile_defaults');
 
-  section.innerHTML = '';
-  const defaultsBtn = document.createElement('button');
-  defaultsBtn.type = 'button';
-  defaultsBtn.id = 'toolsetsProfileDefaultsBtn';
-  defaultsBtn.className = 'toolsets-action-btn toolsets-clear-btn';
-  defaultsBtn.textContent = t('session_toolsets_use_profile_defaults');
-  section.appendChild(defaultsBtn);
+  // Refresh only the TEXT of the stable controls; the nodes themselves stay.
+  const defaultsBtn = $('toolsetsProfileDefaultsBtn');
+  if (defaultsBtn) defaultsBtn.textContent = t('session_toolsets_use_profile_defaults');
+  const serversLabel = $('toolsetsServersLabel');
+  if (serversLabel) serversLabel.textContent = t('session_toolsets_configured_servers');
 
-  _appendToolsetsLabel(section, t('session_toolsets_configured_servers'));
-  if (_toolsetsCatalog === null) {
-    _appendToolsetsLabel(section, t('session_toolsets_loading_servers'));
-    return;
+  const list = $('toolsetsServerList');
+  if (!list) return;
+  let status = null;
+  if (_toolsetsCatalog === null) status = t('session_toolsets_loading_servers');
+  else if (_toolsetsCatalog === false) status = t('mcp_load_failed');
+  else if (!Array.isArray(_toolsetsCatalog) || !_toolsetsCatalog.length) status = t('session_toolsets_no_configured_servers');
+  // Rebuild only when WHAT is listed changes. A selection change - a checkbox
+  // toggle, typing in the field - just flips `checked` below, so the control
+  // the user is operating is never detached from under them. (The full
+  // re-render on every `change` used to drop keyboard focus to <body> after
+  // each Space press on a checkbox.)
+  const key = status !== null ? 'status:' + status : 'servers:' + JSON.stringify(_toolsetsCatalog);
+  if (list.dataset.renderKey !== key) {
+    // The listing can still change under focus - the catalog settling or being
+    // invalidated mid-open. Put focus back on the same server's checkbox
+    // instead of letting it fall to <body>.
+    const active = document.activeElement;
+    const refocus = active && active.classList && list.contains(active)
+      && active.classList.contains('toolsets-server-checkbox') ? active.value : null;
+    list.innerHTML = '';
+    if (status !== null) {
+      _appendToolsetsLabel(list, status);
+    } else {
+      _toolsetsCatalog.forEach(function(name) {
+        const row = document.createElement('label');
+        row.className = 'toolsets-server-option';
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '6px';
+        row.style.margin = '4px 0';
+        row.style.fontSize = '12px';
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.className = 'toolsets-server-checkbox';
+        checkbox.value = name;
+        row.appendChild(checkbox);
+        row.appendChild(document.createTextNode(name));
+        list.appendChild(row);
+      });
+    }
+    list.dataset.renderKey = key;
+    if (refocus !== null) {
+      const again = Array.from(list.querySelectorAll('.toolsets-server-checkbox'))
+        .find(function(cb) { return cb.value === refocus; });
+      if (again) again.focus();
+    }
   }
-  if (_toolsetsCatalog === false) {
-    _appendToolsetsLabel(section, t('mcp_load_failed'));
-    return;
-  }
-  if (!Array.isArray(_toolsetsCatalog) || !_toolsetsCatalog.length) {
-    _appendToolsetsLabel(section, t('session_toolsets_no_configured_servers'));
-    return;
-  }
-  _toolsetsCatalog.forEach(function(name) {
-    const row = document.createElement('label');
-    row.className = 'toolsets-server-option';
-    row.style.display = 'flex';
-    row.style.alignItems = 'center';
-    row.style.gap = '6px';
-    row.style.margin = '4px 0';
-    row.style.fontSize = '12px';
-    const checkbox = document.createElement('input');
-    checkbox.type = 'checkbox';
-    checkbox.className = 'toolsets-server-checkbox';
-    checkbox.value = name;
-    checkbox.checked = selectedSet.has(name);
-    row.appendChild(checkbox);
-    row.appendChild(document.createTextNode(name));
-    section.appendChild(row);
+  list.querySelectorAll('.toolsets-server-checkbox').forEach(function(cb) {
+    cb.checked = selectedSet.has(cb.value);
   });
 }
 
@@ -5804,15 +5845,18 @@ function toggleToolsetsDropdown() {
   if (typeof closeWsDropdown === 'function') closeWsDropdown();
   closeModelDropdown();
   if (typeof closeReasoningDropdown === 'function') closeReasoningDropdown();
+  // This open owns everything it schedules below. A close or a later open bumps
+  // the generation, and these callbacks then stand down: "still open" alone
+  // could not tell a sheet that stayed open from one closed and reopened while
+  // the request was in flight.
+  const gen = ++_toolsetsOpenGeneration;
   _syncToolsetsChip();
   _populateToolsetsDropdown();
   _loadToolsetsCatalog().then(function() {
-    const stillOpen = dd && dd.classList.contains('open');
-    if (stillOpen) {
-      const state = $('toolsetsDropdownState');
-      const input = $('toolsetsInput');
-      _renderToolsetsPresetSections({ state, input });
-    }
+    if (gen !== _toolsetsOpenGeneration) return;
+    const state = $('toolsetsDropdownState');
+    const input = $('toolsetsInput');
+    _renderToolsetsPresetSections({ state, input });
   });
   dd.classList.add('open');
   _positionToolsetsDropdown();
@@ -5823,8 +5867,13 @@ function toggleToolsetsDropdown() {
   // trigger — no keyboard path into the sheet. Land on the first actionable
   // control instead; the profile-defaults button is rendered synchronously by
   // _populateToolsetsDropdown(), so it is a safe fallback while the server
-  // catalog is still loading.
+  // catalog is still loading - and it is never re-created, so the catalog
+  // settling later cannot detach it.
   setTimeout(() => {
+    // Dismissed (or reopened) inside the 50 ms window: this timer belongs to an
+    // open that no longer exists. Acting anyway focused the hidden free-text
+    // field of a closed dropdown, yanking focus out of wherever the user went.
+    if (gen !== _toolsetsOpenGeneration) return;
     if (!dd.classList.contains('composer-toolsets-dropdown--floating')) {
       const inp = $('toolsetsInput'); if (inp) inp.focus();
       return;
@@ -5835,6 +5884,8 @@ function toggleToolsetsDropdown() {
 }
 
 function closeToolsetsDropdown() {
+  // Supersedes whatever the last open scheduled (see _toolsetsOpenGeneration).
+  _toolsetsOpenGeneration++;
   const dd = $('composerToolsetsDropdown');
   if (dd) dd.classList.remove('open');
   _restoreToolsetsDropdownHome();
