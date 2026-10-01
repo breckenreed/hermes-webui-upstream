@@ -832,3 +832,20 @@ class TestFocusAcrossTheOpenLifetime:
         )
         assert out["betaStillChecked"] is True, f"and it must still read as checked; got {out}"
 
+
+class TestResizeOwnership:
+    def test_resize_keeps_the_sheet_when_only_the_burger_action_is_rendered(self):
+        """In `.cf-burger` the chip is hidden by design and the panel action is
+        the visible anchor. The chip-only resize rule closed a valid open sheet."""
+        out = _run_region("resize-burger", stage="burger")
+        assert out["openedFloating"] is True, f"precondition: floating sheet; got {out}"
+        assert out["open"] is True, f"resize must not close a sheet that has an anchor; got {out}"
+        assert out["repositioned"] is True, f"it must be repositioned instead; got {out}"
+
+    def test_resize_keeps_the_sheet_when_the_chip_is_rendered(self):
+        out = _run_region("resize-icons", stage="icons")
+        assert out["open"] is True and out["repositioned"] is True, f"got {out}"
+
+    def test_resize_closes_the_sheet_when_no_entry_point_is_rendered(self):
+        out = _run_region("resize-none-rendered", stage="burger")
+        assert out["open"] is False, f"with no anchor at all the sheet must close; got {out}"

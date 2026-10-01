@@ -5986,15 +5986,16 @@ document.addEventListener('change', function(e) {
   _renderToolsetsPresetSections({ state, input });
 });
 
-// Position toolsets dropdown on resize, OR close it if the chip is no longer
-// visible (e.g. resize crossed the 1100px container threshold while dropdown
-// was open — the wrap is hidden by CSS but the dropdown sibling stays open
-// without an anchor). (#1431)
+// Reposition the open dropdown on resize, or close it once NO entry point is
+// rendered - e.g. resize crossed the 1100px container threshold while it was
+// open and nothing is left to anchor it (#1431). Ownership goes through
+// _activeToolsetsTrigger(), the same rule the toggle uses: in `.cf-burger` the
+// chip is hidden by design while the panel action is the visible anchor, so a
+// chip-only check closed a valid open sheet on every resize.
 window.addEventListener('resize', () => {
   const dd = $('composerToolsetsDropdown');
   if (!dd || !dd.classList.contains('open')) return;
-  const chip = $('composerToolsetsChip');
-  if (!chip || chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  if (!_activeToolsetsTrigger()) { closeToolsetsDropdown(); return; }
   _positionToolsetsDropdown();
 });
 

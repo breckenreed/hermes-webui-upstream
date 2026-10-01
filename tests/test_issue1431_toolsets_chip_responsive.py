@@ -188,26 +188,39 @@ class TestToolsetsDropdownResizeGuard:
     anchor, or stay open with no visible chip to dismiss it from.
     """
 
-    def test_resize_handler_closes_dropdown_when_chip_hidden(self):
-        """Resize listener must close dropdown when the chip is no longer visible."""
+    def test_resize_handler_closes_dropdown_when_no_entry_point_is_rendered(self):
+        """Resize must close the dropdown once NO entry point is rendered.
+
+        CONTRACT CHANGE (PR #7437). This used to pin a chip-only check
+        (`chip.offsetParent === null`). The redesign gave the picker a second
+        entry point: in `.cf-burger` the chip is hidden by design while the
+        mobile panel action is the visible anchor, so the chip-only rule closed
+        a valid open sheet on every resize. Ownership now goes through
+        _activeToolsetsTrigger(), the same rule the toggle uses, which checks
+        both triggers. The original intent - close when the dropdown is left
+        with nothing to anchor it, e.g. after crossing the 1100px threshold -
+        is unchanged, and is proven behaviourally (chip only, burger action
+        only, neither) in tests/test_7437_mobile_toolsets_entry_points.py.
+        """
         js = _src("ui.js")
-        # Find the resize handler block for the toolsets dropdown
-        # It must check chip.offsetParent === null and close, not reposition
         m = re.search(
             r"window\.addEventListener\('resize',\s*\([^)]*\)\s*=>\s*\{[^}]*composerToolsetsDropdown[^}]*\}",
             js, re.DOTALL,
         )
         assert m, "Toolsets resize handler must exist"
         body = m.group(0)
-        assert "offsetParent" in body, (
-            "Resize handler must check chip.offsetParent === null — without it "
-            "the open dropdown stays open after CSS hides the chip mid-session "
-            "(e.g. workspace-panel toggle crossing 1100px threshold)"
+        assert "_activeToolsetsTrigger()" in body, (
+            "Resize must decide ownership through _activeToolsetsTrigger(), so a "
+            "sheet anchored to the burger action is not closed just because the "
+            "chip is hidden"
         )
         assert "closeToolsetsDropdown" in body, (
-            "Resize handler must call closeToolsetsDropdown() when chip is "
-            "hidden — repositioning a hidden chip leaves the dropdown anchored "
-            "to a zero-rect element"
+            "Resize must still call closeToolsetsDropdown() when no entry point "
+            "is rendered - repositioning against nothing leaves the dropdown "
+            "anchored to a zero-rect element"
+        )
+        assert "composerToolsetsChip" not in body, (
+            "Resize must not regress to the chip-only visibility rule"
         )
 
     def test_position_dropdown_guards_against_hidden_chip(self):
