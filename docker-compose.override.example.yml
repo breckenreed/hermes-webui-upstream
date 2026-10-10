@@ -1,0 +1,25 @@
+# Per-machine additions to docker-compose.yml — a TEMPLATE, inert as-is.
+#
+# Compose merges a file named docker-compose.override.yml into every
+# `docker compose up` on its own, so machine-specific tweaks (extra folders,
+# ports) go there and docker-compose.yml stays the same for everyone. That
+# file is gitignored and kept out of the image build: it never leaves your
+# machine.
+#
+#   cp docker-compose.override.example.yml docker-compose.override.yml
+#   # add HERMES_VAULT_DIR=... to .env (see below), then:
+#   docker compose config     # prints the merged result — check the mount
+#   docker compose up -d
+#
+# Mount only what the agent needs. It can read, change and delete everything
+# mounted :rw; use :ro for material it should only read.
+
+services:
+  hermes-webui:
+    volumes:
+      # A folder the agent can work in, e.g. a notes vault. Set the host path
+      # in .env — forward slashes work on Windows too:
+      #   HERMES_VAULT_DIR=C:/Users/you/Documents/MyVault
+      #   HERMES_VAULT_DIR=/Users/you/Vaults/MyVault
+      # If the variable is missing, Compose stops with the message below.
+      - ${HERMES_VAULT_DIR:?set HERMES_VAULT_DIR in .env}:/host/vault:rw

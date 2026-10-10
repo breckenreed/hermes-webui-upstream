@@ -244,6 +244,26 @@ isolated Hermes home and follow
 > for a one-off root run, use `sudo -E docker compose up -d` and verify the
 > rendered mount with `docker compose config` first.
 
+## Adding your own folders (per-machine override)
+
+Folders the agent should reach beyond `~/.hermes` and the workspace — a notes
+vault, a second project directory — belong in `docker-compose.override.yml`,
+not in `docker-compose.yml`. Compose merges the override into every
+`docker compose up` automatically, so your host paths never land in the shared
+compose file. The override is gitignored and excluded from the image build.
+
+Start from the template, then add `HERMES_VAULT_DIR=<host path>` to `.env`
+(forward slashes work on Windows: `C:/Users/you/Documents/MyVault`):
+
+```bash
+cp docker-compose.override.example.yml docker-compose.override.yml
+docker compose config    # the merged result — check the new mount before `up`
+docker compose up -d
+```
+
+The automatic merge only happens next to the default `docker-compose.yml`. With
+`-f docker-compose.two-container.yml`, pass the override as a second `-f`.
+
 ## Optional GPU runtime image
 
 The default Hermes WebUI Docker image stays CPU-only. GPU user-space packages
@@ -783,6 +803,7 @@ volumes:
 - [`docker-compose.two-container.yml`](../docker-compose.two-container.yml) — agent + webui
 - [`docker-compose.three-container.yml`](../docker-compose.three-container.yml) — agent + dashboard + webui
 - [`.env.docker.example`](../.env.docker.example) — environment variable template
+- [`docker-compose.override.example.yml`](../docker-compose.override.example.yml) — per-machine mounts template
 - [`Dockerfile`](../Dockerfile) — single-container build
 - [`docker_init.bash`](../docker_init.bash) — container entrypoint script
 
