@@ -25,6 +25,14 @@ AGENTS.local.md
 .aider*
 copilot-instructions.md
 
+# Per-machine Compose overrides (extra mounts, ports). Compose merges these
+# into `docker compose up` on its own, so a committed one applies to every
+# checkout. Start from docker-compose.override.example.yml instead.
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+
 # Generated screenshots and transient artifacts
 screenshot-*.png
 full-UI.png

@@ -135,8 +135,8 @@ services:
       # Provider secrets that ~/.hermes/config.yaml references as ${VAR}
       # placeholders must exist in THIS container's environment too, or the
       # agent (running in-process here) sends the literal placeholder to the
-      # provider. Set them in .env; unset values pass through as empty.
-      - LLM_CLIENT_UID=${LLM_CLIENT_UID:-}
+      # provider. Set them in .env and list each one here, e.g.:
+      # - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     extra_hosts:
       # Makes host.docker.internal resolve on Linux engines too (Docker Desktop
       # provides it by itself), so the HERMES_API_URL example above is portable.

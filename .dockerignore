@@ -6,3 +6,7 @@ __pycache__
 tests/
 .env*
 /AGENTS.md
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
