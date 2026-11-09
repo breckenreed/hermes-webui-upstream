@@ -353,7 +353,7 @@ class TestToolsetsEntryPoints:
 
 def _panel_slice(src: str) -> str:
     start = src.index("function _syncMobileComposerConfigButton")
-    end = src.index("window.addEventListener('resize',function(){", start)
+    end = src.index("const _phoneWidthQuery=", start)
     return src[start:end]
 
 
