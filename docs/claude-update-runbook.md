@@ -64,7 +64,7 @@ cd REPO && { [ -f docker-compose.override.yml ] || [ ! -f ../docker-compose.over
 **5. Update the agent container.** Skip if there is no `AGENT_DIR`. Run in the background.
 
 ```bash
-cd AGENT_DIR && { docker compose pull --ignore-buildable; docker compose build --pull; docker compose up -d; } > ../hermes-agent-update.log 2>&1; echo "exit=$?"
+cd AGENT_DIR && { docker compose pull --ignore-buildable; docker compose build --pull; MSYS_NO_PATHCONV=1 docker exec hermes-agent rm -f /opt/data/gateway.sock; docker compose up -d; } > ../hermes-agent-update.log 2>&1; echo "exit=$?"
 ```
 
 **6. Rebuild the WebUI with its bundled agent.** 5-15 minutes, in the background.
@@ -98,6 +98,7 @@ WebUI login is theirs. Then stop.
 | Fast-forward removed `docker-compose.override.yml` | Normal when coming from an older commit; step 4 restores it. |
 | `set HERMES_VAULT_DIR in .env` | The override needs that key in `REPO/.env`. Ask the user for the path. |
 | Agent version did not change | `HERMES_AGENT_IMAGE` in `.env` is pinned. Rerun step 6 with `-AgentImage nousresearch/hermes-agent:latest`. |
+| Agent log says `unsafe_control_path ... gateway.sock`, health stays down | Leftover socket from the older version. Remove it as in step 5 and wait 2 minutes for the respawn backoff. |
 | `pull access denied for hermes-webui-doc` | The build failed. Read the log tail. |
 | Port 8799 in use during `-Verify` | Add `-SmokePort 8798`. |
 | Chat fails on a missing `${VAR}` from `config.yaml` | The variable lost its passthrough. Add it under `environment:` in the override, then `docker compose up -d`. |
